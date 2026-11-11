@@ -87,15 +87,28 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "dng-core"
-version = "0.1.0"
+version = "1.7.1"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "half",
+]
 
 [[package]]
 name = "dng-jpeg"
 version = "0.1.0"
+dependencies = [
+ "jpeg-encoder",
+ "zune-core",
+ "zune-jpeg",
+]
 
 [[package]]
 name = "dng-jxl"
 version = "0.1.0"
+dependencies = [
+ "jxl-oxide",
+]
 
 [[package]]
 name = "dng-sdk"
@@ -108,6 +121,9 @@ version = "0.1.0"
 [[package]]
 name = "dng-xmp"
 version = "0.1.0"
+dependencies = [
+ "quick-xml",
+]
 
 [[package]]
 name = "either"

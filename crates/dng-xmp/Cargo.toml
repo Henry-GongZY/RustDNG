@@ -2,4 +2,8 @@
 name = "dng-xmp"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Pure-Rust XMP data model + RDF/XML engine for the RustDNG project (replaces the Adobe XMP Toolkit usage in the DNG SDK)"
+
 [dependencies]
+quick-xml = "0.37"

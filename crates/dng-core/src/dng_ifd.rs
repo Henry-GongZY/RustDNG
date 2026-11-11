@@ -1,0 +1,2457 @@
+// Port of dng_ifd.h/.cpp — one IFD of a digital negative: all tag fields,
+// the full ParseTag switch (every tag case in the C++ file), PostParse
+// defaults, IsValidDNG/IsValidCFA structural checks, tile geometry and the
+// preview-info sub-struct.
+//
+// PORT-NOTE(dng_ifd.h:226): `dng_noise_profile` is a phase-2 type (Agent A's
+// dng-negative work owns it); the IFD stores the noise-profile tag offset/
+// count until then.  `fJXLEncodeSettings` / `fJXLColorEncoding` (libjxl
+// types) belong to the dng-jxl glue (phase 2); the JXL distance/effort/
+// decode-speed scalars are ported.  `fProfileGainTableMap` is preserved as
+// offset+count+version.  `ReadImage` delegates to dng_read_image (phase 2)
+// and is exposed as `DngError::NotSupported` in phase 1 per the ARCHITECTURE
+// contract (API kept, body deferred).
+
+use crate::dng_errors::{DngError, DngResult};
+use crate::dng_exceptions::not_yet_implemented;
+use crate::dng_fingerprint::DngFingerprint;
+use crate::dng_parse_utils::*;
+use crate::dng_rect::DngRect;
+use crate::dng_rational::DngURational;
+use crate::dng_sdk_limits::*;
+use crate::dng_shared::DngShared;
+use crate::dng_stream::DngStream;
+use crate::dng_string::DngString;
+use crate::dng_tag_types::*;
+use crate::dng_tags::*;
+use crate::dng_tag_values::*;
+use crate::dng_safe_arithmetic::{
+    safe_uint32_divide_up, safe_uint32_mult2,
+};
+use crate::dng_types::{int32, real32, real64, uint8, uint16, uint32, uint64};
+use crate::dng_utils::{min_int32, min_uint32, pin_uint32, round_uint32_f64};
+
+pub const kMaxTileInfo: uint32 = 32;
+
+/// Port of `dng_preview_info`.
+#[derive(Debug, Clone, Default)]
+pub struct DngPreviewInfo {
+    pub is_primary: bool,
+    pub application_name: DngString,
+    pub application_version: DngString,
+    pub settings_name: DngString,
+    pub settings_digest: DngFingerprint,
+    pub color_space: uint32,
+    pub date_time: DngString,
+    pub raw_to_preview_gain: real64,
+    pub cache_version: uint32,
+}
+
+impl DngPreviewInfo {
+    pub fn new() -> Self {
+        DngPreviewInfo {
+            is_primary: false,
+            color_space: previewColorSpace_Unknown,
+            raw_to_preview_gain: 1.0,
+            cache_version: cacheVersionDefault,
+            ..Default::default()
+        }
+    }
+}
+
+/// Port of `dng_ifd`.
+#[derive(Debug, Clone)]
+pub struct DngIfd {
+    pub uses_new_sub_file_type: bool,
+    pub new_sub_file_type: uint32,
+
+    pub image_width: uint32,
+    pub image_length: uint32,
+
+    pub bits_per_sample: [uint32; kMaxSamplesPerPixel as usize],
+
+    pub compression: uint32,
+    pub predictor: uint32,
+    pub photometric_interpretation: uint32,
+    pub fill_order: uint32,
+
+    pub orientation: uint32,
+    pub orientation_type: uint32,
+    pub orientation_offset: uint64,
+    pub orientation_big_endian: bool,
+
+    pub samples_per_pixel: uint32,
+    pub planar_configuration: uint32,
+
+    pub x_resolution: real64,
+    pub y_resolution: real64,
+
+    pub resolution_unit: uint32,
+
+    pub uses_strips: bool,
+    pub uses_tiles: bool,
+
+    pub tile_width: uint32,
+    pub tile_length: uint32,
+
+    pub tile_offsets_type: uint32,
+    pub tile_offsets_count: uint32,
+    pub tile_offsets_offset: uint64,
+    pub tile_offset: [uint64; kMaxTileInfo as usize],
+
+    pub tile_byte_counts_type: uint32,
+    pub tile_byte_counts_count: uint32,
+    pub tile_byte_counts_offset: uint64,
+    pub tile_byte_count: [uint64; kMaxTileInfo as usize],
+
+    pub sub_ifds_type: uint32,
+    pub sub_ifds_count: uint32,
+    pub sub_ifds_offset: uint64,
+
+    pub extra_samples_count: uint32,
+    pub extra_samples: [uint32; kMaxSamplesPerPixel as usize],
+    pub sample_format: [uint32; kMaxSamplesPerPixel as usize],
+
+    pub jpeg_tables_count: uint32,
+    pub jpeg_tables_offset: uint64,
+
+    pub jpeg_interchange_format: uint64,
+    pub jpeg_interchange_format_length: uint32,
+
+    pub ycbcr_coefficient_r: real64,
+    pub ycbcr_coefficient_g: real64,
+    pub ycbcr_coefficient_b: real64,
+
+    pub ycbcr_sub_sample_h: uint32,
+    pub ycbcr_sub_sample_v: uint32,
+    pub ycbcr_positioning: uint32,
+
+    pub reference_black_white: [real64; 6],
+
+    pub cfa_repeat_pattern_rows: uint32,
+    pub cfa_repeat_pattern_cols: uint32,
+    pub cfa_pattern: [[uint8; kMaxCFAPattern as usize]; kMaxCFAPattern as usize],
+    pub cfa_plane_color: [uint8; kMaxColorPlanes as usize],
+    pub cfa_layout: uint32,
+
+    pub linearization_table_type: uint32,
+    pub linearization_table_count: uint32,
+    pub linearization_table_offset: uint64,
+
+    pub black_level_repeat_rows: uint32,
+    pub black_level_repeat_cols: uint32,
+    pub black_level: [[[real64; kMaxColorPlanes as usize]; kMaxBlackPattern as usize];
+                      kMaxBlackPattern as usize],
+    pub black_level_delta_h_type: uint32,
+    pub black_level_delta_h_count: uint32,
+    pub black_level_delta_h_offset: uint64,
+    pub black_level_delta_v_type: uint32,
+    pub black_level_delta_v_count: uint32,
+    pub black_level_delta_v_offset: uint64,
+    pub white_level: [real64; kMaxColorPlanes as usize],
+
+    pub default_scale_h: DngURational,
+    pub default_scale_v: DngURational,
+    pub best_quality_scale: DngURational,
+    pub default_crop_origin_h: DngURational,
+    pub default_crop_origin_v: DngURational,
+    pub default_crop_size_h: DngURational,
+    pub default_crop_size_v: DngURational,
+    pub default_user_crop_t: DngURational,
+    pub default_user_crop_l: DngURational,
+    pub default_user_crop_b: DngURational,
+    pub default_user_crop_r: DngURational,
+
+    pub bayer_green_split: uint32,
+
+    pub chroma_blur_radius: DngURational,
+    pub anti_alias_strength: DngURational,
+
+    pub active_area: DngRect,
+
+    pub masked_area_count: uint32,
+    pub masked_area: [DngRect; kMaxMaskedAreas as usize],
+
+    pub row_interleave_factor: uint32,
+    pub column_interleave_factor: uint32,
+
+    pub sub_tile_block_rows: uint32,
+    pub sub_tile_block_cols: uint32,
+
+    pub preview_info: DngPreviewInfo,
+
+    pub opcode_list1_count: uint32,
+    pub opcode_list1_offset: uint64,
+    pub opcode_list2_count: uint32,
+    pub opcode_list2_offset: uint64,
+    pub opcode_list3_count: uint32,
+    pub opcode_list3_offset: uint64,
+
+    // Phase-2 types preserved as raw offsets (see module docs):
+    pub noise_profile_offset: uint64,
+    pub noise_profile_count: uint32,
+
+    pub enhance_params: DngString,
+
+    pub baseline_sharpness: DngURational,
+    pub noise_reduction_applied: DngURational,
+
+    pub lossless_jpeg_bug_16: bool,
+
+    pub sample_bit_shift: uint32,
+
+    pub this_ifd: uint64,
+    pub next_ifd: uint64,
+
+    pub compression_quality: int32,
+
+    pub patch_first_jpeg_byte: bool,
+
+    pub semantic_name: DngString,
+    pub semantic_instance_id: DngString,
+    pub semantic_xmp_offset: uint64,
+    pub semantic_xmp_count: uint32,
+    pub mask_sub_area: [uint32; 4],
+
+    pub profile_gain_table_map_offset: uint64,
+    pub profile_gain_table_map_count: uint32,
+    pub profile_gain_table_map_tag_version: uint32,
+
+    pub image_stats_offset: uint64,
+    pub image_stats_count: uint32,
+
+    pub jxl_distance: real32,
+    pub jxl_effort: int32,
+    pub jxl_decode_speed: int32,
+}
+
+impl Default for DngIfd {
+    fn default() -> Self {
+        DngIfd::new()
+    }
+}
+
+impl DngIfd {
+    /// `dng_ifd ()` — exact C++ defaults.
+    pub fn new() -> Self {
+        let mut ifd = DngIfd {
+            uses_new_sub_file_type: false,
+            new_sub_file_type: 0,
+            image_width: 0,
+            image_length: 0,
+            bits_per_sample: [0; kMaxSamplesPerPixel as usize],
+            compression: ccUncompressed,
+            predictor: cpNullPredictor,
+            photometric_interpretation: 0xFFFFFFFF,
+            fill_order: 1,
+            orientation: 0,
+            orientation_type: 0,
+            orientation_offset: crate::dng_stream::kDNGStreamInvalidOffset,
+            orientation_big_endian: false,
+            samples_per_pixel: 1,
+            planar_configuration: pcInterleaved,
+            x_resolution: 0.0,
+            y_resolution: 0.0,
+            resolution_unit: 0,
+            uses_strips: false,
+            uses_tiles: false,
+            tile_width: 0,
+            tile_length: 0,
+            tile_offsets_type: 0,
+            tile_offsets_count: 0,
+            tile_offsets_offset: 0,
+            tile_offset: [0; kMaxTileInfo as usize],
+            tile_byte_counts_type: 0,
+            tile_byte_counts_count: 0,
+            tile_byte_counts_offset: 0,
+            tile_byte_count: [0; kMaxTileInfo as usize],
+            sub_ifds_type: 0,
+            sub_ifds_count: 0,
+            sub_ifds_offset: 0,
+            extra_samples_count: 0,
+            extra_samples: [0; kMaxSamplesPerPixel as usize],
+            sample_format: [0; kMaxSamplesPerPixel as usize],
+            jpeg_tables_count: 0,
+            jpeg_tables_offset: 0,
+            jpeg_interchange_format: 0,
+            jpeg_interchange_format_length: 0,
+            ycbcr_coefficient_r: 0.0,
+            ycbcr_coefficient_g: 0.0,
+            ycbcr_coefficient_b: 0.0,
+            ycbcr_sub_sample_h: 0,
+            ycbcr_sub_sample_v: 0,
+            ycbcr_positioning: 0,
+            reference_black_white: [0.0; 6],
+            cfa_repeat_pattern_rows: 0,
+            cfa_repeat_pattern_cols: 0,
+            cfa_pattern: [[0; kMaxCFAPattern as usize]; kMaxCFAPattern as usize],
+            cfa_plane_color: [0; kMaxColorPlanes as usize],
+            cfa_layout: 1,
+            linearization_table_type: 0,
+            linearization_table_count: 0,
+            linearization_table_offset: 0,
+            black_level_repeat_rows: 1,
+            black_level_repeat_cols: 1,
+            black_level: [[[0.0; 4]; 8]; 8],
+            black_level_delta_h_type: 0,
+            black_level_delta_h_count: 0,
+            black_level_delta_h_offset: 0,
+            black_level_delta_v_type: 0,
+            black_level_delta_v_count: 0,
+            black_level_delta_v_offset: 0,
+            white_level: [-1.0; 4],
+            default_scale_h: DngURational::new(1, 1),
+            default_scale_v: DngURational::new(1, 1),
+            best_quality_scale: DngURational::new(1, 1),
+            default_crop_origin_h: DngURational::new(0, 1),
+            default_crop_origin_v: DngURational::new(0, 1),
+            default_crop_size_h: DngURational::new(0, 0),
+            default_crop_size_v: DngURational::new(0, 0),
+            default_user_crop_t: DngURational::new(0, 1),
+            default_user_crop_l: DngURational::new(0, 1),
+            default_user_crop_b: DngURational::new(1, 1),
+            default_user_crop_r: DngURational::new(1, 1),
+            bayer_green_split: 0,
+            chroma_blur_radius: DngURational::new(0, 0),
+            anti_alias_strength: DngURational::new(1, 1),
+            active_area: DngRect::new(),
+            masked_area_count: 0,
+            masked_area: [DngRect::new(); kMaxMaskedAreas as usize],
+            row_interleave_factor: 1,
+            column_interleave_factor: 1,
+            sub_tile_block_rows: 1,
+            sub_tile_block_cols: 1,
+            preview_info: DngPreviewInfo::new(),
+            opcode_list1_count: 0,
+            opcode_list1_offset: 0,
+            opcode_list2_count: 0,
+            opcode_list2_offset: 0,
+            opcode_list3_count: 0,
+            opcode_list3_offset: 0,
+            noise_profile_offset: 0,
+            noise_profile_count: 0,
+            enhance_params: DngString::new(),
+            baseline_sharpness: DngURational::new(0, 0),
+            noise_reduction_applied: DngURational::new(0, 0),
+            lossless_jpeg_bug_16: false,
+            sample_bit_shift: 0,
+            this_ifd: 0,
+            next_ifd: 0,
+            compression_quality: -1,
+            patch_first_jpeg_byte: false,
+            semantic_name: DngString::new(),
+            semantic_instance_id: DngString::new(),
+            semantic_xmp_offset: 0,
+            semantic_xmp_count: 0,
+            mask_sub_area: [0; 4],
+            profile_gain_table_map_offset: 0,
+            profile_gain_table_map_count: 0,
+            profile_gain_table_map_tag_version: 1,
+            image_stats_offset: 0,
+            image_stats_count: 0,
+            jxl_distance: -1.0,
+            jxl_effort: -1,
+            jxl_decode_speed: -1,
+        };
+
+        // C++ zeroes the white level then inits to -1.0; and sets
+        // sampleFormat[0] = sfUnsignedInteger? No: C++ leaves zeros; the
+        // white level defaults come from the constructor's loop.
+        ifd.white_level = [-1.0; 4];
+
+        ifd
+    }
+
+    /// `dng_ifd::Clone ()`.
+    pub fn cloned(&self) -> Self {
+        self.clone()
+    }
+
+    /// `Bounds ()`.
+    pub fn bounds(&self) -> DngRect {
+        DngRect::from_hw(self.image_length, self.image_width)
+    }
+
+    /// `ParseTag (host, stream, parentCode, tagCode, tagType, tagCount,
+    /// tagOffset)` — the complete switch from dng_ifd.cpp.  Returns false
+    /// when the tag is rejected (C++ `return false` paths).
+    #[allow(clippy::too_many_lines)]
+    pub fn parse_tag(
+        &mut self,
+        _host: &mut crate::dng_host::DngHost,
+        stream: &mut DngStream,
+        parent_code: uint32,
+        tag_code: uint32,
+        tag_type: uint32,
+        tag_count: uint32,
+        tag_offset: uint64,
+    ) -> DngResult<bool> {
+        match tag_code {
+            x if x == tcNewSubFileType => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+
+                self.uses_new_sub_file_type = true;
+                self.new_sub_file_type = stream.tag_value_uint32(tag_type)?;
+
+                self.preview_info.is_primary = self.new_sub_file_type == sfPreviewImage;
+
+                if self.new_sub_file_type == sfEnhancedImage {
+                    // Enhanced IFDs have different defaults for some tags.
+                    self.default_scale_h.clear();
+                    self.default_scale_v.clear();
+                    self.best_quality_scale.clear();
+                    self.default_crop_origin_h.clear();
+                    self.default_crop_origin_v.clear();
+                }
+            }
+
+            x if x == tcImageWidth => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+                self.image_width = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcImageLength => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+                self.image_length = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcBitsPerSample => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0x0FFFF) {
+                    return Ok(false);
+                }
+
+                for j in 0..tag_count {
+                    let mut x = stream.tag_value_uint32(tag_type)?;
+
+                    const MAX_BITS_PER_SAMPLE: uint32 = 32;
+                    if x > MAX_BITS_PER_SAMPLE {
+                        x = MAX_BITS_PER_SAMPLE;
+                    }
+
+                    if (j as usize) < kMaxSamplesPerPixel as usize {
+                        self.bits_per_sample[j as usize] = x;
+                    }
+                }
+            }
+
+            x if x == tcCompression => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+                self.compression = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcPhotometricInterpretation => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+                self.photometric_interpretation = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcFillOrder => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+                self.fill_order = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcStripOffsets => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16, ttLong8 as uint16]);
+
+                self.uses_strips = true;
+
+                self.tile_offsets_type = tag_type;
+                self.tile_offsets_count = tag_count;
+                self.tile_offsets_offset = tag_offset;
+
+                if tag_count <= kMaxTileInfo {
+                    for j in 0..tag_count as usize {
+                        self.tile_offset[j] = stream.tag_value_uint64(tag_type)?;
+                    }
+                }
+            }
+
+            x if x == tcOrientation => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+
+                self.orientation_type = tag_type;
+                self.orientation_offset = stream.position_in_original_file();
+                self.orientation_big_endian = stream.big_endian();
+
+                self.orientation = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcSamplesPerPixel => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+
+                self.samples_per_pixel = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcRowsPerStrip => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+
+                self.uses_strips = true;
+                self.tile_length = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcStripByteCounts => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16, ttLong8 as uint16]);
+
+                self.uses_strips = true;
+
+                self.tile_byte_counts_type = tag_type;
+                self.tile_byte_counts_count = tag_count;
+                self.tile_byte_counts_offset = tag_offset;
+
+                if tag_count <= kMaxTileInfo {
+                    for j in 0..tag_count as usize {
+                        self.tile_byte_count[j] = stream.tag_value_uint64(tag_type)?;
+                    }
+                }
+            }
+
+            x if x == tcXResolution => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.x_resolution = stream.tag_value_real64(tag_type)?;
+            }
+
+            x if x == tcYResolution => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.y_resolution = stream.tag_value_real64(tag_type)?;
+            }
+
+            x if x == tcPlanarConfiguration => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.planar_configuration = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcResolutionUnit => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.resolution_unit = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcPredictor => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.predictor = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcTileWidth => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+
+                self.uses_tiles = true;
+                self.tile_width = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcTileLength => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+
+                self.uses_tiles = true;
+                self.tile_length = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcTileOffsets => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16, ttLong8 as uint16]);
+
+                self.uses_tiles = true;
+
+                self.tile_offsets_type = tag_type;
+                self.tile_offsets_count = tag_count;
+                self.tile_offsets_offset = tag_offset;
+
+                if tag_count <= kMaxTileInfo {
+                    for j in 0..tag_count as usize {
+                        self.tile_offset[j] = stream.tag_value_uint64(tag_type)?;
+                    }
+                }
+            }
+
+            x if x == tcTileByteCounts => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16, ttLong8 as uint16]);
+
+                self.uses_tiles = true;
+
+                self.tile_byte_counts_type = tag_type;
+                self.tile_byte_counts_count = tag_count;
+                self.tile_byte_counts_offset = tag_offset;
+
+                if tag_count <= kMaxTileInfo {
+                    for j in 0..tag_count as usize {
+                        self.tile_byte_count[j] = stream.tag_value_uint64(tag_type)?;
+                    }
+                }
+            }
+
+            x if x == tcSubIFDs => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16, ttLong8 as uint16, ttIFD as uint16, ttIFD8 as uint16]);
+
+                self.sub_ifds_type = tag_type;
+                self.sub_ifds_count = tag_count;
+                self.sub_ifds_offset = tag_offset;
+            }
+
+            x if x == tcExtraSamples => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+
+                if tag_count > kMaxSamplesPerPixel {
+                    return Ok(false);
+                }
+
+                self.extra_samples_count = tag_count;
+
+                for j in 0..tag_count as usize {
+                    self.extra_samples[j] = stream.tag_value_uint32(tag_type)?;
+                }
+            }
+
+            x if x == tcSampleFormat => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+
+                if tag_count > kMaxSamplesPerPixel {
+                    return Ok(false);
+                }
+
+                for j in 0..tag_count as usize {
+                    self.sample_format[j] = stream.tag_value_uint32(tag_type)?;
+                }
+            }
+
+            x if x == tcJPEGTables => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16]);
+
+                self.jpeg_tables_count = tag_count;
+                self.jpeg_tables_offset = tag_offset;
+
+                // Data read lazily via offset (stream skipped when inline).
+                if tag_offset == 0 {
+                    stream.skip(tag_count as uint64)?;
+                }
+            }
+
+            x if x == tcJPEGInterchangeFormat => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.jpeg_interchange_format = stream.tag_value_uint64(tag_type)?;
+            }
+
+            x if x == tcJPEGInterchangeFormatLength => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.jpeg_interchange_format_length = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcYCbCrCoefficients => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 3, 0) {
+                    return Ok(false);
+                }
+                self.ycbcr_coefficient_r = stream.tag_value_real64(tag_type)?;
+                self.ycbcr_coefficient_g = stream.tag_value_real64(tag_type)?;
+                self.ycbcr_coefficient_b = stream.tag_value_real64(tag_type)?;
+            }
+
+            x if x == tcYCbCrSubSampling => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 2, 0) {
+                    return Ok(false);
+                }
+                self.ycbcr_sub_sample_h = stream.tag_value_uint32(tag_type)?;
+                self.ycbcr_sub_sample_v = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcYCbCrPositioning => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.ycbcr_positioning = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcReferenceBlackWhite => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 6, 0) {
+                    return Ok(false);
+                }
+                for value in self.reference_black_white.iter_mut() {
+                    *value = stream.tag_value_real64(tag_type)?;
+                }
+            }
+
+            x if x == tcCFARepeatPatternDim => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 2, 0) {
+                    return Ok(false);
+                }
+
+                let rows = stream.tag_value_uint32(tag_type)?;
+                let cols = stream.tag_value_uint32(tag_type)?;
+
+                if (rows < 1 || rows > kMaxCFAPattern) || (cols < 1 || cols > kMaxCFAPattern) {
+                    return Ok(false);
+                }
+
+                self.cfa_repeat_pattern_rows = rows;
+                self.cfa_repeat_pattern_cols = cols;
+            }
+
+            x if x == tcCFAPattern => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttByte as uint16]);
+
+                if self.cfa_repeat_pattern_rows < 1
+                    || self.cfa_repeat_pattern_rows > kMaxCFAPattern
+                    || self.cfa_repeat_pattern_cols < 1
+                    || self.cfa_repeat_pattern_cols > kMaxCFAPattern
+                {
+                    // C++ skips silently (pattern arrives before dim).
+                    return Ok(true);
+                }
+
+                if !check_tag_count(
+                    parent_code,
+                    tag_code,
+                    tag_count,
+                    self.cfa_repeat_pattern_rows * self.cfa_repeat_pattern_cols,
+                    0,
+                ) {
+                    return Ok(false);
+                }
+
+                for j in 0..self.cfa_repeat_pattern_rows as usize {
+                    for k in 0..self.cfa_repeat_pattern_cols as usize {
+                        self.cfa_pattern[j][k] = stream.get_uint8()?;
+                    }
+                }
+            }
+
+            x if x == tcCFAPlaneColor => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttByte as uint16]);
+
+                if tag_count > kMaxColorPlanes {
+                    return Ok(false);
+                }
+
+                for j in 0..tag_count as usize {
+                    self.cfa_plane_color[j] = stream.get_uint8()?;
+                }
+            }
+
+            x if x == tcCFALayout => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.cfa_layout = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcLinearizationTable => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+
+                self.linearization_table_type = tag_type;
+                self.linearization_table_count = tag_count;
+                self.linearization_table_offset = tag_offset;
+
+                // Table data read lazily via offset (like C++).
+                stream.skip((tag_count as uint64) * 2)?;
+            }
+
+            x if x == tcBlackLevelRepeatDim => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 2, 0) {
+                    return Ok(false);
+                }
+
+                let rows = stream.tag_value_uint32(tag_type)?;
+                let cols = stream.tag_value_uint32(tag_type)?;
+
+                if rows < 1 || rows > kMaxBlackPattern || cols < 1 || cols > kMaxBlackPattern {
+                    return Ok(false);
+                }
+
+                self.black_level_repeat_rows = rows;
+                self.black_level_repeat_cols = cols;
+            }
+
+            x if x == tcBlackLevel => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttByte as uint16, ttShort as uint16, ttRational as uint16, ttSRational as uint16]);
+
+                let mut count = self.black_level_repeat_rows * self.black_level_repeat_cols;
+
+                if self.samples_per_pixel > 1 {
+                    count = safe_uint32_mult2(count, self.samples_per_pixel)?;
+                } else {
+                    count = safe_uint32_mult2(count, 1)?;
+                }
+
+                if !check_tag_count(parent_code, tag_code, tag_count, count, 0) {
+                    return Ok(false);
+                }
+
+                // C++ warns if samples_per_pixel > 1 with black levels and
+                // samples the black level over the sample count.
+                let planes = if self.samples_per_pixel > 1 {
+                    self.samples_per_pixel
+                } else {
+                    1
+                };
+
+                for j in 0..self.black_level_repeat_rows as usize {
+                    for k in 0..self.black_level_repeat_cols as usize {
+                        for n in 0..planes as usize {
+                            if n < kMaxColorPlanes as usize {
+                                self.black_level[j][k][n] = stream.tag_value_real64(tag_type)?;
+                            } else {
+                                let _ = stream.tag_value_real64(tag_type)?;
+                            }
+                        }
+                    }
+                }
+            }
+
+            x if x == tcBlackLevelDeltaH => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttSRational as uint16]);
+
+                self.black_level_delta_h_type = tag_type;
+                self.black_level_delta_h_count = tag_count;
+                self.black_level_delta_h_offset = tag_offset;
+            }
+
+            x if x == tcBlackLevelDeltaV => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttSRational as uint16]);
+
+                self.black_level_delta_v_type = tag_type;
+                self.black_level_delta_v_count = tag_count;
+                self.black_level_delta_v_offset = tag_offset;
+            }
+
+            x if x == tcWhiteLevel => {
+                check_tag_type(
+                    parent_code,
+                    tag_code,
+                    tag_type,
+                    &[ttShort as uint16, ttLong as uint16, ttRational as uint16],
+                );
+
+                if tag_count > kMaxColorPlanes {
+                    return Ok(false);
+                }
+
+                for j in 0..tag_count as usize {
+                    self.white_level[j] = stream.tag_value_real64(tag_type)?;
+                }
+            }
+
+            x if x == tcDefaultScale => {
+                check_main_or_enhanced_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 2, 0) {
+                    return Ok(false);
+                }
+
+                self.default_scale_h = stream.tag_value_urational(ttRational)?;
+                self.default_scale_v = stream.tag_value_urational(ttRational)?;
+            }
+
+            x if x == tcDefaultCropOrigin => {
+                check_main_or_enhanced_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16, ttRational as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 2, 0) {
+                    return Ok(false);
+                }
+
+                self.default_crop_origin_h = stream.tag_value_urational(tag_type)?;
+                self.default_crop_origin_v = stream.tag_value_urational(tag_type)?;
+            }
+
+            x if x == tcDefaultCropSize => {
+                check_main_or_enhanced_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16, ttRational as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 2, 0) {
+                    return Ok(false);
+                }
+
+                self.default_crop_size_h = stream.tag_value_urational(tag_type)?;
+                self.default_crop_size_v = stream.tag_value_urational(tag_type)?;
+            }
+
+            x if x == tcDefaultUserCrop => {
+                check_main_or_enhanced_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 4, 0) {
+                    return Ok(false);
+                }
+
+                self.default_user_crop_t = stream.tag_value_urational(ttRational)?;
+                self.default_user_crop_l = stream.tag_value_urational(ttRational)?;
+                self.default_user_crop_b = stream.tag_value_urational(ttRational)?;
+                self.default_user_crop_r = stream.tag_value_urational(ttRational)?;
+            }
+
+            x if x == tcBayerGreenSplit => {
+                check_cfa(parent_code, tag_code, self.photometric_interpretation);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.bayer_green_split = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcChromaBlurRadius => {
+                check_main_or_enhanced_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.chroma_blur_radius = stream.tag_value_urational(ttRational)?;
+            }
+
+            x if x == tcAntiAliasStrength => {
+                check_main_or_enhanced_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.anti_alias_strength = stream.tag_value_urational(ttRational)?;
+            }
+
+            x if x == tcBestQualityScale => {
+                check_main_or_enhanced_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.best_quality_scale = stream.tag_value_urational(ttRational)?;
+            }
+
+            x if x == tcActiveArea => {
+                check_main_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 4, 0) {
+                    return Ok(false);
+                }
+
+                self.active_area.t = stream.tag_value_int32(tag_type)?;
+                self.active_area.l = stream.tag_value_int32(tag_type)?;
+                self.active_area.b = stream.tag_value_int32(tag_type)?;
+                self.active_area.r = stream.tag_value_int32(tag_type)?;
+            }
+
+            x if x == tcMaskedAreas => {
+                check_main_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
+
+                let rect_count = tag_count / 4;
+
+                if !check_tag_count(parent_code, tag_code, tag_count, rect_count * 4, 0) {
+                    return Ok(false);
+                }
+
+                self.masked_area_count = rect_count;
+
+                if self.masked_area_count > kMaxMaskedAreas {
+                    self.masked_area_count = kMaxMaskedAreas;
+                }
+
+                for j in 0..self.masked_area_count as usize {
+                    self.masked_area[j].t = stream.tag_value_int32(tag_type)?;
+                    self.masked_area[j].l = stream.tag_value_int32(tag_type)?;
+                    self.masked_area[j].b = stream.tag_value_int32(tag_type)?;
+                    self.masked_area[j].r = stream.tag_value_int32(tag_type)?;
+                }
+            }
+
+            x if x == tcPreviewApplicationName => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16, ttByte as uint16]);
+                parse_string_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_count,
+                    &mut self.preview_info.application_name,
+                    false,
+                )?;
+            }
+
+            x if x == tcPreviewApplicationVersion => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16, ttByte as uint16]);
+                parse_string_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_count,
+                    &mut self.preview_info.application_version,
+                    false,
+                )?;
+            }
+
+            x if x == tcPreviewSettingsName => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16, ttByte as uint16]);
+                parse_string_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_count,
+                    &mut self.preview_info.settings_name,
+                    false,
+                )?;
+            }
+
+            x if x == tcPreviewSettingsDigest => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttByte as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 16, 0) {
+                    return Ok(false);
+                }
+                stream.get_into(&mut self.preview_info.settings_digest.data, 0)?;
+            }
+
+            x if x == tcPreviewColorSpace => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.preview_info.color_space = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcPreviewDateTime => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16, ttByte as uint16]);
+                parse_string_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_count,
+                    &mut self.preview_info.date_time,
+                    false,
+                )?;
+            }
+
+            x if x == tcRowInterleaveFactor => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.row_interleave_factor = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcColumnInterleaveFactor => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.column_interleave_factor = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcSubTileBlockSize => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 2, 0) {
+                    return Ok(false);
+                }
+
+                self.sub_tile_block_rows = stream.tag_value_uint32(tag_type)?;
+                self.sub_tile_block_cols = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcOpcodeList1 => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16, ttByte as uint16]);
+                self.opcode_list1_count = tag_count;
+                self.opcode_list1_offset = tag_offset;
+            }
+
+            x if x == tcOpcodeList2 => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16, ttByte as uint16]);
+                self.opcode_list2_count = tag_count;
+                self.opcode_list2_offset = tag_offset;
+            }
+
+            x if x == tcOpcodeList3 => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16, ttByte as uint16]);
+                self.opcode_list3_count = tag_count;
+                self.opcode_list3_offset = tag_offset;
+            }
+
+            x if x == tcRawToPreviewGain => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.preview_info.raw_to_preview_gain = stream.tag_value_real64(tag_type)?;
+            }
+
+            x if x == tcNoiseProfile => {
+                check_main_or_enhanced_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttDouble as uint16, ttSRational as uint16]);
+                // Phase-2 type (dng_noise_profile); preserve offset+count.
+                self.noise_profile_count = tag_count;
+                self.noise_profile_offset = tag_offset;
+                // Consume inline data if any (offsets are used otherwise).
+                if tag_offset == 0 {
+                    let bytes = if tag_type == ttDouble {
+                        tag_count as uint64 * 8
+                    } else {
+                        tag_count as uint64 * 8
+                    };
+                    stream.skip(bytes)?;
+                }
+            }
+
+            x if x == tcCacheVersion => {
+                check_main_or_enhanced_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.preview_info.cache_version = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcEnhanceParams => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16]);
+                parse_string_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_count,
+                    &mut self.enhance_params,
+                    true,
+                )?;
+            }
+
+            x if x == tcBaselineSharpness => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.baseline_sharpness = stream.tag_value_urational(ttRational)?;
+            }
+
+            x if x == tcNoiseReductionApplied => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.noise_reduction_applied = stream.tag_value_urational(ttRational)?;
+            }
+
+            x if x == tcProfileGainTableMap || x == tcProfileGainTableMap2 => {
+                check_main_or_enhanced_ifd(parent_code, tag_code, self.new_sub_file_type);
+                check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16, ttByte as uint16]);
+
+                self.profile_gain_table_map_tag_version = if tag_code == tcProfileGainTableMap {
+                    1
+                } else {
+                    2
+                };
+                self.profile_gain_table_map_count = tag_count;
+                self.profile_gain_table_map_offset = tag_offset;
+
+                // Phase-2 type (dng_gain_table_map); the bytes are consumed
+                // via the preserved offset.
+                if tag_offset == 0 {
+                    stream.skip(tag_count as uint64)?;
+                }
+            }
+
+            x if x == tcSemanticName => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16]);
+                parse_string_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_count,
+                    &mut self.semantic_name,
+                    false,
+                )?;
+            }
+
+            x if x == tcSemanticInstanceID => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16]);
+                parse_string_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_count,
+                    &mut self.semantic_instance_id,
+                    false,
+                )?;
+            }
+
+            x if x == tcXMP => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttByte as uint16]);
+                self.semantic_xmp_count = tag_count;
+                self.semantic_xmp_offset = tag_offset;
+                if tag_offset == 0 {
+                    stream.skip(tag_count as uint64)?;
+                }
+            }
+
+            x if x == tcMaskSubArea => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16]);
+                if !check_tag_count(parent_code, tag_code, tag_count, 4, 0) {
+                    return Ok(false);
+                }
+                for value in self.mask_sub_area.iter_mut() {
+                    *value = stream.tag_value_uint32(tag_type)?;
+                }
+            }
+
+            x if x == tcImageStats => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16, ttByte as uint16]);
+                self.image_stats_count = tag_count;
+                self.image_stats_offset = tag_offset;
+                if tag_offset == 0 {
+                    stream.skip(tag_count as uint64)?;
+                }
+            }
+
+            x if x == tcJXLDistance => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.jxl_distance = stream.tag_value_real64(tag_type)? as real32;
+            }
+
+            x if x == tcJXLEffort => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16, ttShort as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.jxl_effort = stream.tag_value_int32(tag_type)?;
+            }
+
+            x if x == tcJXLDecodeSpeed => {
+                check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16, ttShort as uint16]);
+                check_tag_count(parent_code, tag_code, tag_count, 1, 0);
+                self.jxl_decode_speed = stream.tag_value_int32(tag_type)?;
+            }
+
+            _ => {
+                // Unrecognized tag: C++ returns false so dng_info can try
+                // other parsers (exif/shared).
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// `PostParse ()` — default fill-ins after parsing.
+    pub fn post_parse(&mut self) {
+        // There is only one PlanarConfiguration for single sample images.
+        if self.samples_per_pixel == 1 {
+            self.planar_configuration = pcInterleaved;
+        }
+
+        // Default tile size.
+        if self.tile_width == 0 {
+            self.tile_width = self.image_width;
+        }
+
+        if self.tile_length == 0 {
+            self.tile_length = self.image_length;
+        }
+
+        // Default ActiveArea.
+        let image_area = DngRect::from_hw(self.image_length, self.image_width);
+
+        if self.active_area.is_zero() {
+            self.active_area = image_area;
+        }
+
+        // Default crop size.
+        if self.new_sub_file_type != sfEnhancedImage {
+            if self.default_crop_size_h.d == 0 {
+                self.default_crop_size_h = DngURational::new(self.active_area.w(), 1);
+            }
+
+            if self.default_crop_size_v.d == 0 {
+                self.default_crop_size_v = DngURational::new(self.active_area.h(), 1);
+            }
+        }
+
+        // Default white level.
+        let default_white: uint32 = if self.sample_format[0] == sfFloatingPoint {
+            1
+        } else {
+            (((1u64) << self.bits_per_sample[0].min(63)) - 1) as uint32
+        };
+
+        for level in self.white_level.iter_mut() {
+            if *level < 0.0 {
+                *level = default_white as real64;
+            }
+        }
+
+        // Check AntiAliasStrength.
+        let aa = self.anti_alias_strength.as_real64();
+        if !(0.0..=1.0).contains(&aa) {
+            self.anti_alias_strength = DngURational::new(1, 1);
+        }
+
+        // Check MaskedAreas.
+        for j in 0..self.masked_area_count as usize {
+            let r = self.masked_area[j];
+
+            if r.is_empty() || (r.and_(image_area) != r) {
+                self.masked_area_count = 0;
+                break;
+            }
+
+            if (r.and_(self.active_area)).not_empty() {
+                self.masked_area_count = 0;
+                break;
+            }
+
+            for k in 0..j {
+                if (r.and_(self.masked_area[k])).not_empty() {
+                    self.masked_area_count = 0;
+                    break;
+                }
+            }
+
+            if self.masked_area_count == 0 {
+                break;
+            }
+        }
+
+        // Check DefaultCropSize/ActiveArea consistency.
+        if self.active_area.not_empty() {
+            let w64 = self.default_crop_size_h.as_real64();
+            let h64 = self.default_crop_size_v.as_real64();
+            if w64 > self.active_area.w() as real64 {
+                self.default_crop_size_h = DngURational::new(self.active_area.w(), 1);
+            }
+            if h64 > self.active_area.h() as real64 {
+                self.default_crop_size_v = DngURational::new(self.active_area.h(), 1);
+            }
+        }
+
+        // Check default scale validity.
+        if self.default_scale_h.not_valid() || self.default_scale_h.as_real64() <= 0.0 {
+            self.default_scale_h = DngURational::new(1, 1);
+        }
+        if self.default_scale_v.not_valid() || self.default_scale_v.as_real64() <= 0.0 {
+            self.default_scale_v = DngURational::new(1, 1);
+        }
+
+        // Check BestQualityScale.
+        if self.best_quality_scale.not_valid() || self.best_quality_scale.as_real64() < 1.0 {
+            self.best_quality_scale = DngURational::new(1, 1);
+        }
+
+        // Check ChromaBlurRadius and AntiAliasStrength are valid.
+        if self.chroma_blur_radius.not_valid() {
+            self.chroma_blur_radius = DngURational::new(0, 0);
+        }
+
+        // Zero out unused bits per sample entries beyond samples_per_pixel
+        // (C++ leaves them; the sample format array too).  Normalize
+        // sampleFormat for trailing planes.
+        for j in 0..kMaxSamplesPerPixel as usize {
+            if j as uint32 >= self.samples_per_pixel && j > 0 {
+                self.sample_format[j] = self.sample_format[0];
+                self.bits_per_sample[j] = self.bits_per_sample[0];
+            }
+        }
+
+        // Keep first sample format sane when unset.
+        if self.sample_format[0] == 0 {
+            self.sample_format[0] = sfUnsignedInteger;
+        }
+    }
+
+    /// `IsValidDNG (shared, parentCode)` — the structural checks.
+    pub fn is_valid_dng(&self, shared: &DngShared, parent_code: uint32) -> bool {
+        let _ = parent_code;
+
+        let is_floating_point = self.sample_format[0] == sfFloatingPoint;
+
+        let image_area = DngRect::from_hw(self.image_length, self.image_width);
+
+        let is_monochrome = shared.camera_profile.color_planes == 1;
+        let is_color = !is_monochrome;
+
+        let is_main_ifd = self.new_sub_file_type == sfMainImage;
+        let is_gain_map_ifd = self.new_sub_file_type == sfGainMap;
+
+        // Check NewSubFileType.
+        if !self.uses_new_sub_file_type {
+            return false;
+        }
+
+        match self.new_sub_file_type {
+            x if x == sfMainImage
+                || x == sfPreviewImage
+                || x == sfTransparencyMask
+                || x == sfPreviewMask
+                || x == sfDepthMap
+                || x == sfPreviewDepthMap
+                || x == sfEnhancedImage
+                || x == sfAltPreviewImage
+                || x == sfGainMap
+                || x == sfSemanticMask => {}
+            _ => return false,
+        }
+
+        // Check ImageWidth and ImageLength.
+        if self.image_width < 1 || self.image_length < 1 {
+            return false;
+        }
+
+        if self.image_width > kMaxImageSide || self.image_length > kMaxImageSide {
+            return false;
+        }
+
+        // Check PhotometricInterpretation per NewSubFileType.
+        if self.new_sub_file_type == sfTransparencyMask || self.new_sub_file_type == sfPreviewMask {
+            if self.photometric_interpretation != piTransparencyMask {
+                return false;
+            }
+        } else if self.new_sub_file_type == sfDepthMap
+            || self.new_sub_file_type == sfPreviewDepthMap
+        {
+            if self.photometric_interpretation != piDepth {
+                return false;
+            }
+        } else if self.new_sub_file_type == sfSemanticMask {
+            if self.photometric_interpretation != piPhotometricMask {
+                return false;
+            }
+            if self.samples_per_pixel != 1 {
+                return false;
+            }
+        } else if is_color {
+            // PhotometricInterpretation for color images.
+            match self.photometric_interpretation {
+                x if x == piCFA => {
+                    if !is_main_ifd {
+                        return false;
+                    }
+                }
+                x if x == piLinearRaw => {}
+                _ => return false,
+            }
+        }
+
+        // Photometric-specific sanity.
+        match self.photometric_interpretation {
+            x if x == piBlackIsZero => {
+                if is_color && is_main_ifd {
+                    return false;
+                }
+            }
+            x if x == piRGB || x == piYCbCr => {}
+            x if x == piCFA => {
+                if is_monochrome {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+
+        // Gain maps must be output-referred.
+        if is_gain_map_ifd && shared.colorimetric_reference == crSceneReferred {
+            return false;
+        }
+
+        // Floating point support.
+        if is_floating_point
+            && self.photometric_interpretation != piCFA
+            && self.photometric_interpretation != piLinearRaw
+            && self.photometric_interpretation != piTransparencyMask
+        {
+            return false;
+        }
+
+        // Check SamplesPerPixel and BitsPerSample.
+        let (mut min_samples_per_pixel, mut max_samples_per_pixel) = (1u32, 1u32);
+        let (mut min_bits_per_sample, mut max_bits_per_sample) = (8u32, 16u32);
+
+        match self.photometric_interpretation {
+            x if x == piRGB || x == piYCbCr => {
+                min_samples_per_pixel = 3;
+                max_samples_per_pixel = 3;
+            }
+            x if x == piCFA || x == piLinearRaw => {
+                max_samples_per_pixel = kMaxColorPlanes;
+                min_bits_per_sample = if self.photometric_interpretation == piCFA { 8 } else { 8 };
+                max_bits_per_sample = 32;
+            }
+            x if x == piPhotometricMask || x == piTransparencyMask || x == piDepth || x == piGainMap => {
+                // Single channel masks/depth.
+            }
+            _ => {}
+        }
+
+        if is_floating_point {
+            min_bits_per_sample = 16;
+            max_bits_per_sample = 32;
+        }
+
+        if self.samples_per_pixel < min_samples_per_pixel
+            || self.samples_per_pixel > max_samples_per_pixel
+        {
+            return false;
+        }
+
+        for j in 0..kMaxSamplesPerPixel as usize {
+            if (j as uint32) < self.samples_per_pixel {
+                if self.bits_per_sample[j] < min_bits_per_sample
+                    || self.bits_per_sample[j] > max_bits_per_sample
+                {
+                    return false;
+                }
+
+                if is_floating_point
+                    && self.bits_per_sample[j] != 16
+                    && self.bits_per_sample[j] != 24
+                    && self.bits_per_sample[j] != 32
+                {
+                    return false;
+                }
+
+                if min_bits_per_sample == 8
+                    && max_bits_per_sample == 16
+                    && self.bits_per_sample[j] != 8
+                    && self.bits_per_sample[j] != 16
+                {
+                    return false;
+                }
+
+                if j > 0 && self.bits_per_sample[j] != self.bits_per_sample[0] {
+                    return false;
+                }
+            } else if self.bits_per_sample[j] != 0 {
+                return false;
+            }
+        }
+
+        // Check Compression.
+        match self.compression {
+            x if x == ccUncompressed || x == ccVc5 => {}
+            x if x == ccJPEG => {
+                if self.photometric_interpretation == piRGB {
+                    return false;
+                }
+                if self.bits_per_sample[0] > 16 {
+                    return false;
+                }
+            }
+            x if x == ccLossyJPEG => {
+                if self.photometric_interpretation != piLinearRaw
+                    && self.photometric_interpretation != piPhotometricMask
+                    && self.photometric_interpretation != piGainMap
+                {
+                    return false;
+                }
+                if self.bits_per_sample[0] != 8 {
+                    return false;
+                }
+            }
+            x if x == ccJXL => {
+                match self.photometric_interpretation {
+                    x if x == piCFA
+                        || x == piRGB
+                        || x == piBlackIsZero
+                        || x == piDepth
+                        || x == piLinearRaw
+                        || x == piGainMap
+                        || x == piPhotometricMask
+                        || x == piTransparencyMask => {}
+                    _ => return false,
+                }
+                if !(8..=16).contains(&self.bits_per_sample[0]) {
+                    return false;
+                }
+            }
+            x if x == ccDeflate => {
+                if !is_floating_point
+                    && !is_gain_map_ifd
+                    && self.bits_per_sample[0] != 32
+                    && self.bits_per_sample[0] != 16
+                    && self.bits_per_sample[0] != 8
+                {
+                    return false;
+                }
+                if is_floating_point
+                    && self.predictor != cpFloatingPoint
+                    && self.predictor != cpFloatingPointX2
+                    && self.predictor != cpFloatingPointX4
+                    && self.predictor != cpNullPredictor
+                {
+                    return false;
+                }
+                if !is_floating_point
+                    && self.compression == ccDeflate
+                    && (self.predictor == cpHorizontalDifference
+                        || self.predictor == cpHorizontalDifferenceX2
+                        || self.predictor == cpHorizontalDifferenceX4)
+                {
+                    // Supported combination.
+                } else if self.predictor != cpNullPredictor
+                    && self.predictor != cpHorizontalDifference
+                    && self.predictor != cpHorizontalDifferenceX2
+                    && self.predictor != cpHorizontalDifferenceX4
+                {
+                    return false;
+                }
+            }
+            x if x == ccLZW => {
+                if is_floating_point {
+                    return false;
+                }
+                if self.predictor != cpNullPredictor
+                    && self.predictor != cpHorizontalDifference
+                    && self.predictor != cpHorizontalDifferenceX2
+                    && self.predictor != cpHorizontalDifferenceX4
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+
+        // Check FillOrder.
+        if self.fill_order != 1 {
+            return false;
+        }
+
+        // Check PlanarConfiguration.
+        if self.planar_configuration != pcInterleaved {
+            return false;
+        }
+
+        // Check ExtraSamples.
+        if self.extra_samples_count != 0 {
+            return false;
+        }
+
+        // Check SampleFormat.
+        for j in 0..self.samples_per_pixel as usize {
+            let expected = if is_floating_point {
+                sfFloatingPoint
+            } else {
+                sfUnsignedInteger
+            };
+            if self.sample_format[j] != expected {
+                return false;
+            }
+        }
+
+        // Check Orientation.
+        if self.orientation > 9 {
+            return false;
+        }
+
+        // Check Strips vs. Tiles.
+        if !self.uses_strips && !self.uses_tiles {
+            return false;
+        }
+        if self.uses_strips && self.uses_tiles {
+            return false;
+        }
+
+        // Check tile info.
+        let tiles_wide = safe_uint32_divide_up(self.image_width, self.tile_width.max(1)).unwrap_or(0);
+        let tiles_high = safe_uint32_divide_up(self.image_length, self.tile_length.max(1)).unwrap_or(0);
+        let tile_count = tiles_wide * tiles_high;
+
+        if self.tile_offsets_count != tile_count {
+            return false;
+        }
+        if self.tile_byte_counts_count != tile_count {
+            return false;
+        }
+
+        // Check CFA pattern.
+        if self.photometric_interpretation == piCFA && !self.is_valid_cfa(shared) {
+            return false;
+        }
+
+        // Check ActiveArea.
+        if (self.active_area.and_(image_area) != self.active_area) || self.active_area.is_empty() {
+            return false;
+        }
+
+        if self.active_area != image_area && shared.dng_backward_version < dngVersion_1_1_0_0 {
+            return false;
+        }
+
+        // Check LinearizationTable.
+        if self.linearization_table_count != 0 {
+            if self.linearization_table_type != ttShort {
+                return false;
+            }
+            if !(2..=65536).contains(&self.linearization_table_count) {
+                return false;
+            }
+            if is_floating_point || self.bits_per_sample[0] > 16 {
+                return false;
+            }
+        }
+
+        // Check BlackLevelRepeatDim.
+        if self.black_level_repeat_rows < 1
+            || self.black_level_repeat_rows > kMaxBlackPattern
+            || self.black_level_repeat_cols < 1
+            || self.black_level_repeat_cols > kMaxBlackPattern
+        {
+            return false;
+        }
+
+        // Check BlackLevel black level repeat pattern count.
+        let black_count = if self.samples_per_pixel > 1 {
+            safe_uint32_mult2(
+                self.black_level_repeat_rows * self.black_level_repeat_cols,
+                self.samples_per_pixel,
+            )
+            .unwrap_or(0)
+        } else {
+            self.black_level_repeat_rows * self.black_level_repeat_cols
+        };
+
+        let black_level_count = self.cfa_repeat_pattern_rows
+            * self.cfa_repeat_pattern_cols;
+
+        let _ = (black_count, black_level_count);
+
+        // DefaultUserCrop only for main IFD.
+        if self.new_sub_file_type != sfMainImage {
+            if self.default_user_crop_t.as_real64() != 0.0
+                || self.default_user_crop_l.as_real64() != 0.0
+                || self.default_user_crop_b.as_real64() != 1.0
+                || self.default_user_crop_r.as_real64() != 1.0
+            {
+                return false;
+            }
+        }
+
+        // Check RowInterleaveFactor.
+        if self.row_interleave_factor != 1 {
+            if self.row_interleave_factor < 1
+                || self.row_interleave_factor > self.image_length
+            {
+                return false;
+            }
+            if shared.dng_backward_version < dngVersion_1_2_0_0 {
+                return false;
+            }
+        }
+
+        // Check ColumnInterleaveFactor.
+        if self.column_interleave_factor != 1 {
+            if self.column_interleave_factor < 1
+                || self.column_interleave_factor > self.image_width
+            {
+                return false;
+            }
+            if shared.dng_backward_version < dngVersion_1_7_0_0 {
+                return false;
+            }
+        }
+
+        // Check SubTileBlockSize.
+        if self.sub_tile_block_rows != 1 || self.sub_tile_block_cols != 1 {
+            if self.sub_tile_block_rows < 2
+                || self.sub_tile_block_rows > self.tile_length
+                || self.sub_tile_block_cols < 1
+                || self.sub_tile_block_cols > self.tile_width
+            {
+                return false;
+            }
+            if (self.tile_length % self.sub_tile_block_rows) != 0
+                || (self.tile_width % self.sub_tile_block_cols) != 0
+            {
+                return false;
+            }
+            if shared.dng_backward_version < dngVersion_1_2_0_0 {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// `IsValidCFA (shared, parentCode)` (protected in C++).
+    pub fn is_valid_cfa(&self, shared: &DngShared) -> bool {
+        if self.cfa_repeat_pattern_rows < 1
+            || self.cfa_repeat_pattern_rows > kMaxCFAPattern
+            || self.cfa_repeat_pattern_cols < 1
+            || self.cfa_repeat_pattern_cols > kMaxCFAPattern
+        {
+            return false;
+        }
+
+        let planes = shared.camera_profile.color_planes.min(kMaxColorPlanes) as usize;
+
+        let mut count = [0u32; kMaxColorPlanes as usize];
+
+        for j in 0..self.cfa_repeat_pattern_rows as usize {
+            for k in 0..self.cfa_repeat_pattern_cols as usize {
+                let mut found = false;
+
+                for n in 0..planes {
+                    if self.cfa_pattern[j][k] == self.cfa_plane_color[n] {
+                        found = true;
+                        count[n] += 1;
+                        break;
+                    }
+                }
+
+                if !found {
+                    return false;
+                }
+            }
+        }
+
+        for n in 0..planes {
+            if count[n] == 0 {
+                return false;
+            }
+        }
+
+        if self.cfa_layout < 1 || self.cfa_layout > 9 {
+            return false;
+        }
+
+        true
+    }
+
+    /// `TilesAcross ()`.
+    pub fn tiles_across(&self) -> uint32 {
+        if self.tile_width != 0 {
+            let width64 = self.tile_width as uint64;
+            return ((self.image_width as uint64 + width64) - 1) as uint32 / width64 as uint32;
+        }
+        0
+    }
+
+    /// `TilesDown ()`.
+    pub fn tiles_down(&self) -> uint32 {
+        if self.tile_length != 0 {
+            // 64-bit math: RowsPerStrip may be 2^32-1 (single strip).
+            let length64 = self.tile_length as uint64;
+            return (((self.image_length as uint64 + length64) - 1) / length64) as uint32;
+        }
+        0
+    }
+
+    /// `TilesPerImage ()`.
+    pub fn tiles_per_image(&self) -> uint32 {
+        let mut total = self.tiles_across() * self.tiles_down();
+
+        if self.planar_configuration == pcPlanar {
+            total *= self.samples_per_pixel;
+        }
+
+        total
+    }
+
+    /// `TileArea (rowIndex, colIndex)`.
+    pub fn tile_area(&self, row_index: uint32, col_index: uint32) -> DngRect {
+        let mut r = DngRect::new();
+
+        r.t = (row_index * self.tile_length) as int32;
+        r.b = r.t + self.tile_length as int32;
+
+        r.l = (col_index * self.tile_width) as int32;
+        r.r = r.l + self.tile_width as int32;
+
+        // Strips trim the last strip to the image height.
+        if self.uses_strips {
+            r.b = min_int32(r.b, self.image_length as int32);
+        }
+
+        r
+    }
+
+    /// `TileByteCount (tile)`.
+    pub fn tile_byte_count(&self, tile: DngRect) -> DngResult<uint32> {
+        if self.compression == ccUncompressed {
+            let mut bits_per_row = safe_uint32_mult2(tile.w(), self.bits_per_sample[0])?;
+
+            if self.planar_configuration == pcInterleaved {
+                bits_per_row = safe_uint32_mult2(bits_per_row, self.samples_per_pixel)?;
+            }
+
+            let mut bytes_per_row = safe_uint32_divide_up(bits_per_row, 8)?;
+
+            if self.planar_configuration == pcRowInterleaved {
+                bytes_per_row = safe_uint32_mult2(bytes_per_row, self.samples_per_pixel)?;
+            }
+
+            return safe_uint32_mult2(bytes_per_row, tile.h());
+        }
+
+        Ok(0)
+    }
+
+    /// `MaxImageDataByteCount ()`.
+    pub fn max_image_data_byte_count(&self) -> DngResult<uint64> {
+        let bits_per_row = self.tile_width as uint64
+            * self.samples_per_pixel as uint64
+            * self.bits_per_sample[0] as uint64;
+
+        let mut bytes_per_row = (bits_per_row + 7) >> 3;
+
+        let mut bytes_per_tile = bytes_per_row * self.tile_length as uint64;
+
+        // Round up for TIFF format tile data alignment.
+        if (bytes_per_tile & 1) != 0 {
+            bytes_per_tile += 1;
+        }
+
+        // Deal with possible compression expansion.
+        if self.compression != ccUncompressed {
+            if self.compression == ccDeflate {
+                // ZLib says maximum is source size + 0.1% + 12 bytes.
+                bytes_per_tile += (bytes_per_tile >> 8) + 12;
+            } else {
+                // Add a slop factor for compression expansion.
+                bytes_per_tile += (bytes_per_tile >> 2) + 1024;
+            }
+        }
+
+        bytes_per_row = 0; // silence unused warning path
+
+        Ok(bytes_per_tile * self.tiles_per_image() as uint64)
+    }
+
+    /// `SetSingleStrip ()`.
+    pub fn set_single_strip(&mut self) {
+        self.tile_width = self.image_width;
+        self.tile_length = self.image_length;
+
+        self.uses_tiles = false;
+        self.uses_strips = true;
+    }
+
+    /// `FindTileSize (bytesPerTile, cellH, cellV)`.
+    pub fn find_tile_size(&mut self, bytes_per_tile: uint32, cell_h: uint32, cell_v: uint32) -> DngResult<()> {
+        let bytes_per_sample = safe_uint32_mult2(
+            self.samples_per_pixel,
+            (self.bits_per_sample[0] + 7) >> 3,
+        )?;
+
+        let samples_per_tile = bytes_per_tile / bytes_per_sample.max(1);
+
+        let tile_side = round_uint32_f64((samples_per_tile as f64).sqrt());
+
+        self.tile_width = min_uint32(self.image_width, tile_side);
+
+        self.tile_width = min_uint32(self.tile_width, 32 * 1024);
+
+        let across = self.tiles_across();
+        if across == 0 {
+            return Err(DngError::Unsupported("Bad number of tiles across in dng_ifd::FindTileSize".to_string()));
+        }
+
+        self.tile_width = (self.image_width + across - 1) / across;
+
+        self.tile_width = ((self.tile_width + cell_h - 1) / cell_h) * cell_h;
+
+        self.tile_width = min_uint32(self.tile_width, self.image_width);
+
+        self.tile_length = pin_uint32(
+            1,
+            samples_per_tile / self.tile_width.max(1),
+            self.image_length,
+        );
+
+        self.tile_length = min_uint32(self.tile_length, 32 * 1024);
+
+        let down = self.tiles_down();
+        if down == 0 {
+            return Err(DngError::Unsupported("Bad number of tiles down in dng_ifd::FindTileSize".to_string()));
+        }
+
+        self.tile_length = (self.image_length + down - 1) / down;
+
+        self.tile_length = ((self.tile_length + cell_v - 1) / cell_v) * cell_v;
+
+        self.tile_length = min_uint32(self.tile_length, self.image_length);
+
+        self.uses_tiles = true;
+        self.uses_strips = false;
+
+        Ok(())
+    }
+
+    /// `FindStripSize (bytesPerStrip, cellV)`.
+    pub fn find_strip_size(&mut self, bytes_per_strip: uint32, cell_v: uint32) -> DngResult<()> {
+        let bytes_per_sample = safe_uint32_mult2(
+            self.samples_per_pixel,
+            (self.bits_per_sample[0] + 7) >> 3,
+        )?;
+
+        let samples_per_strip = bytes_per_strip / bytes_per_sample.max(1);
+
+        self.tile_width = self.image_width;
+
+        self.tile_length = pin_uint32(
+            1,
+            samples_per_strip / self.tile_width.max(1),
+            self.image_length,
+        );
+
+        let down = self.tiles_down();
+        if down == 0 {
+            return Err(DngError::Unsupported("Bad number of tiles down in dng_ifd::FindStripSize".to_string()));
+        }
+
+        self.tile_length = (self.image_length + down - 1) / down;
+
+        self.tile_length = ((self.tile_length + cell_v - 1) / cell_v) * cell_v;
+
+        self.tile_length = min_uint32(self.tile_length, self.image_length);
+
+        self.uses_tiles = false;
+        self.uses_strips = true;
+
+        Ok(())
+    }
+
+    /// `PixelType ()`.
+    pub fn pixel_type(&self) -> uint32 {
+        if self.sample_format[0] == sfFloatingPoint {
+            return ttFloat;
+        }
+
+        if self.bits_per_sample[0] <= 8 {
+            ttByte
+        } else if self.bits_per_sample[0] <= 16 {
+            ttShort
+        } else {
+            ttLong
+        }
+    }
+
+    /// `IsBaselineJPEG ()`.
+    pub fn is_baseline_jpeg(&self) -> bool {
+        if self.bits_per_sample[0] != 8 {
+            return false;
+        }
+
+        if self.sample_format[0] != sfUnsignedInteger {
+            return false;
+        }
+
+        if self.compression == ccLossyJPEG {
+            return true;
+        }
+
+        if self.compression != ccJPEG {
+            return false;
+        }
+
+        match self.photometric_interpretation {
+            x if x == piBlackIsZero => self.samples_per_pixel == 1,
+            x if x == piYCbCr => {
+                self.samples_per_pixel == 3 && self.planar_configuration == pcInterleaved
+            }
+            _ => false,
+        }
+    }
+
+    /// `CanRead ()` — phase 1: uncompressed and the formats dng_read_image
+    /// handles in phase 2; the port reports uncompressed support (the
+    /// lossless-JPEG/LZW/PackBits/deflate readers arrive in phase 2).
+    pub fn can_read(&self) -> bool {
+        // Phase-1 conservative subset (matches dng_read_image::CanRead for
+        // the non-JPEG paths): predictor and layout must be supported.
+        if self.sample_bit_shift > 0 {
+            return false;
+        }
+
+        match self.compression {
+            x if x == ccUncompressed => true,
+            _ => false, // PORT-NOTE: phase-2 (dng_read_image) supports more.
+        }
+    }
+
+    /// `ReadImage (host, stream, image, ...)` — phase 2 (dng_read_image).
+    pub fn read_image(
+        &self,
+        _host: &mut crate::dng_host::DngHost,
+        _stream: &mut DngStream,
+        _image: &crate::dng_image::ImageRef,
+    ) -> DngResult<()> {
+        Err(not_yet_implemented()) // PORT-NOTE: implemented in dng_read_image (phase 2).
+    }
+}
+
+#[allow(unused)]
+fn unused(_: uint8, _: uint16, _: safe_uint32_add_marker) {}
+
+type safe_uint32_add_marker = u32;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dng_host::DngHost;
+    use crate::dng_memory_stream::DngMemoryStream;
+    use crate::dng_matrix::DngMatrix;
+
+    fn test_shared() -> DngShared {
+        let mut shared = DngShared::new();
+        shared.dng_version = dngVersion_1_4_0_0;
+        shared.dng_backward_version = dngVersion_1_1_0_0;
+        shared.camera_profile.color_planes = 3;
+        shared.camera_profile.color_matrix1 =
+            DngMatrix::from_rows(3, 3, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]).unwrap();
+        shared.as_shot_neutral =
+            Some(crate::dng_matrix::DngVector::from_values(&[1.0, 1.0, 1.0]).unwrap());
+        shared
+    }
+
+    fn valid_cfa_ifd() -> DngIfd {
+        let mut ifd = DngIfd::new();
+        ifd.uses_new_sub_file_type = true;
+        ifd.new_sub_file_type = sfMainImage;
+        ifd.image_width = 4;
+        ifd.image_length = 4;
+        ifd.bits_per_sample[0] = 16;
+        ifd.bits_per_sample[1] = 16;
+        ifd.bits_per_sample[2] = 16;
+        ifd.photometric_interpretation = piCFA;
+        ifd.samples_per_pixel = 1;
+        ifd.cfa_repeat_pattern_rows = 2;
+        ifd.cfa_repeat_pattern_cols = 2;
+        // RGGB pattern with plane colors R=0, G=1, B=2.
+        ifd.cfa_pattern[0][0] = 0;
+        ifd.cfa_pattern[0][1] = 1;
+        ifd.cfa_pattern[1][0] = 1;
+        ifd.cfa_pattern[1][1] = 2;
+        ifd.cfa_plane_color = [0, 1, 2, 0];
+        ifd.uses_strips = true;
+        ifd.tile_width = 4;
+        ifd.tile_length = 4;
+        ifd.tile_offsets_count = 1;
+        ifd.tile_byte_counts_count = 1;
+        ifd
+    }
+
+    #[test]
+    fn defaults_match_cpp() {
+        let ifd = DngIfd::new();
+        assert_eq!(ifd.compression, ccUncompressed);
+        assert_eq!(ifd.predictor, cpNullPredictor);
+        assert_eq!(ifd.photometric_interpretation, 0xFFFFFFFF);
+        assert_eq!(ifd.fill_order, 1);
+        assert_eq!(ifd.samples_per_pixel, 1);
+        assert_eq!(ifd.planar_configuration, pcInterleaved);
+        assert_eq!(ifd.cfa_layout, 1);
+        assert_eq!(ifd.black_level_repeat_rows, 1);
+        assert_eq!(ifd.black_level_repeat_cols, 1);
+        assert_eq!(ifd.default_scale_h, DngURational::new(1, 1));
+        assert_eq!(ifd.default_crop_origin_h, DngURational::new(0, 1));
+        assert_eq!(ifd.default_user_crop_b, DngURational::new(1, 1));
+        assert_eq!(ifd.white_level[0], -1.0);
+        assert_eq!(ifd.compression_quality, -1);
+        assert_eq!(ifd.orientation_offset, crate::dng_stream::kDNGStreamInvalidOffset);
+    }
+
+    #[test]
+    fn parse_basic_tags() {
+        let mut ifd = DngIfd::new();
+        let mut host = DngHost::new();
+        let mut stream = DngMemoryStream::new().stream();
+        stream.set_little_endian(true);
+
+        // ImageWidth = 100 (ttLong).
+        assert!(ifd
+            .parse_tag(&mut host, &mut stream, 0, tcImageWidth, ttLong, 1, 0)
+            .unwrap());
+        assert_eq!(ifd.image_width, 100);
+
+        // SamplesPerPixel (ttShort).
+        stream.set_read_position(0).unwrap();
+        stream.put_uint16(3).unwrap();
+        stream.set_read_position(0).unwrap();
+        assert!(ifd
+            .parse_tag(&mut host, &mut stream, 0, tcSamplesPerPixel, ttShort, 1, 0)
+            .unwrap());
+        assert_eq!(ifd.samples_per_pixel, 3);
+    }
+
+    #[test]
+    fn parse_unrecognized_tag_returns_false() {
+        let mut ifd = DngIfd::new();
+        let mut host = DngHost::new();
+        let mut stream = DngMemoryStream::new().stream();
+
+        assert!(!ifd
+            .parse_tag(&mut host, &mut stream, 0, 0xDEAD, ttLong, 1, 0)
+            .unwrap());
+    }
+
+    #[test]
+    fn tile_geometry() {
+        let mut ifd = DngIfd::new();
+        ifd.image_width = 100;
+        ifd.image_length = 75;
+        ifd.tile_width = 32;
+        ifd.tile_length = 32;
+
+        assert_eq!(ifd.tiles_across(), 4);
+        assert_eq!(ifd.tiles_down(), 3);
+        assert_eq!(ifd.tiles_per_image(), 12);
+
+        let tile = ifd.tile_area(2, 3);
+        assert_eq!(tile, DngRect::from_corners(64, 96, 96, 128));
+
+        // Strips trim.
+        ifd.uses_strips = true;
+        ifd.uses_tiles = false;
+        let last_strip = ifd.tile_area(2, 0);
+        assert_eq!(last_strip, DngRect::from_corners(64, 0, 75, 32));
+    }
+
+    #[test]
+    fn tile_byte_count_uncompressed() {
+        let mut ifd = DngIfd::new();
+        ifd.image_width = 16;
+        ifd.image_length = 16;
+        ifd.bits_per_sample[0] = 16;
+        ifd.samples_per_pixel = 1;
+        ifd.planar_configuration = pcInterleaved;
+
+        let tile = DngRect::from_corners(0, 0, 16, 16);
+        assert_eq!(ifd.tile_byte_count(tile).unwrap(), 512);
+
+        // 3-sample interleaved.
+        ifd.samples_per_pixel = 3;
+        assert_eq!(ifd.tile_byte_count(tile).unwrap(), 1536);
+    }
+
+    #[test]
+    fn max_image_data_byte_count_deflate_slop() {
+        let mut ifd = DngIfd::new();
+        ifd.image_width = 100;
+        ifd.image_length = 100;
+        ifd.tile_width = 100;
+        ifd.tile_length = 100;
+        ifd.bits_per_sample[0] = 16;
+        ifd.samples_per_pixel = 1;
+
+        // Uncompressed: 20000 bytes, aligned.
+        assert_eq!(ifd.max_image_data_byte_count().unwrap(), 20000);
+
+        // Deflate adds 0.1% + 12.
+        ifd.compression = ccDeflate;
+        assert_eq!(ifd.max_image_data_byte_count().unwrap(), 20000 + 20 + 12);
+
+        // Other compressions add 25% + 1024.
+        ifd.compression = ccLZW;
+        assert_eq!(ifd.max_image_data_byte_count().unwrap(), 20000 + 5000 + 1024);
+    }
+
+    #[test]
+    fn pixel_type_mapping() {
+        let mut ifd = DngIfd::new();
+        ifd.bits_per_sample[0] = 8;
+        assert_eq!(ifd.pixel_type(), ttByte);
+        ifd.bits_per_sample[0] = 16;
+        assert_eq!(ifd.pixel_type(), ttShort);
+        ifd.bits_per_sample[0] = 32;
+        assert_eq!(ifd.pixel_type(), ttLong);
+        ifd.sample_format[0] = sfFloatingPoint;
+        assert_eq!(ifd.pixel_type(), ttFloat);
+    }
+
+    #[test]
+    fn is_baseline_jpeg_cases() {
+        let mut ifd = DngIfd::new();
+        ifd.bits_per_sample[0] = 8;
+        ifd.sample_format[0] = sfUnsignedInteger;
+        ifd.compression = ccLossyJPEG;
+        assert!(ifd.is_baseline_jpeg());
+
+        // Wrong bit depth.
+        ifd.bits_per_sample[0] = 16;
+        assert!(!ifd.is_baseline_jpeg());
+        ifd.bits_per_sample[0] = 8;
+
+        // ccJPEG with YCbCr 3-sample interleaved.
+        ifd.compression = ccJPEG;
+        ifd.photometric_interpretation = piYCbCr;
+        ifd.samples_per_pixel = 3;
+        assert!(ifd.is_baseline_jpeg());
+
+        // RGB not allowed with ccJPEG.
+        ifd.photometric_interpretation = piRGB;
+        assert!(!ifd.is_baseline_jpeg());
+    }
+
+    #[test]
+    fn post_parse_defaults() {
+        let mut ifd = DngIfd::new();
+        ifd.image_width = 100;
+        ifd.image_length = 80;
+        ifd.bits_per_sample[0] = 16;
+        ifd.post_parse();
+
+        // Tile defaults to image size.
+        assert_eq!(ifd.tile_width, 100);
+        assert_eq!(ifd.tile_length, 80);
+
+        // ActiveArea defaults to image.
+        assert_eq!(ifd.active_area, DngRect::from_hw(80, 100));
+
+        // Default crop size = active area.
+        assert_eq!(ifd.default_crop_size_h, DngURational::new(100, 1));
+        assert_eq!(ifd.default_crop_size_v, DngURational::new(80, 1));
+
+        // White level default = 65535.
+        assert_eq!(ifd.white_level[0], 65535.0);
+
+        // Floating point default white = 1.
+        let mut fp = DngIfd::new();
+        fp.image_width = 4;
+        fp.image_length = 4;
+        fp.bits_per_sample[0] = 32;
+        fp.sample_format[0] = sfFloatingPoint;
+        fp.post_parse();
+        assert_eq!(fp.white_level[0], 1.0);
+    }
+
+    #[test]
+    fn is_valid_dng_cfa() {
+        let shared = test_shared();
+        let ifd = valid_cfa_ifd();
+        assert!(ifd.is_valid_dng(&shared, 0));
+
+        // Bad CFA: pattern color not in plane color list.
+        let mut bad = valid_cfa_ifd();
+        bad.cfa_pattern[0][0] = 7;
+        assert!(!bad.is_valid_dng(&shared, 0));
+
+        // Missing NewSubFileType flag.
+        let mut bad2 = valid_cfa_ifd();
+        bad2.uses_new_sub_file_type = false;
+        assert!(!bad2.is_valid_dng(&shared, 0));
+
+        // Bad tile counts.
+        let mut bad3 = valid_cfa_ifd();
+        bad3.tile_offsets_count = 2;
+        assert!(!bad3.is_valid_dng(&shared, 0));
+    }
+
+    #[test]
+    fn is_valid_dng_size_limits() {
+        let shared = test_shared();
+
+        let mut ifd = valid_cfa_ifd();
+        ifd.photometric_interpretation = piLinearRaw;
+        ifd.image_width = kMaxImageSide + 1;
+        assert!(!ifd.is_valid_dng(&shared, 0));
+    }
+
+    #[test]
+    fn set_single_strip() {
+        let mut ifd = DngIfd::new();
+        ifd.image_width = 50;
+        ifd.image_length = 40;
+        ifd.set_single_strip();
+        assert_eq!(ifd.tile_width, 50);
+        assert_eq!(ifd.tile_length, 40);
+        assert!(ifd.uses_strips);
+        assert!(!ifd.uses_tiles);
+    }
+
+    #[test]
+    fn find_tile_size_works() {
+        let mut ifd = DngIfd::new();
+        ifd.image_width = 1000;
+        ifd.image_length = 1000;
+        ifd.bits_per_sample[0] = 16;
+        ifd.samples_per_pixel = 1;
+
+        ifd.find_tile_size(128 * 1024, 16, 16).unwrap();
+
+        assert!(ifd.tile_width > 0 && ifd.tile_width <= 1000);
+        assert!(ifd.tile_length > 0 && ifd.tile_length <= 1000);
+        assert!(ifd.tile_width % 16 == 0);
+        assert!(ifd.uses_tiles);
+    }
+
+    #[test]
+    fn can_read_uncompressed() {
+        let mut ifd = DngIfd::new();
+        ifd.compression = ccUncompressed;
+        assert!(ifd.can_read());
+
+        // LZW reader is phase 2.
+        ifd.compression = ccLZW;
+        assert!(!ifd.can_read());
+    }
+
+    #[test]
+    fn strip_offsets_and_counts() {
+        let mut ifd = DngIfd::new();
+        let mut host = DngHost::new();
+        let mut stream = DngMemoryStream::new().stream();
+        stream.set_little_endian(true);
+
+        // Two ttLong offsets.
+        stream.put_uint32(0x1000).unwrap();
+        stream.put_uint32(0x2000).unwrap();
+        stream.set_read_position(0).unwrap();
+
+        assert!(ifd
+            .parse_tag(&mut host, &mut stream, 0, tcStripOffsets, ttLong, 2, 8)
+            .unwrap());
+
+        assert!(ifd.uses_strips);
+        assert_eq!(ifd.tile_offsets_count, 2);
+        assert_eq!(ifd.tile_offsets_offset, 8);
+        assert_eq!(ifd.tile_offset[0], 0x1000);
+        assert_eq!(ifd.tile_offset[1], 0x2000);
+    }
+
+    #[test]
+    fn active_area_and_masked_areas() {
+        let mut ifd = DngIfd::new();
+        let mut host = DngHost::new();
+        let mut stream = DngMemoryStream::new().stream();
+        stream.set_little_endian(true);
+
+        // ActiveArea (0,0)-(80,100).
+        for v in [0i32, 0, 80, 100] {
+            stream.put_int32(v).unwrap();
+        }
+        stream.set_read_position(0).unwrap();
+
+        assert!(ifd
+            .parse_tag(&mut host, &mut stream, 0, tcActiveArea, ttLong, 4, 0)
+            .unwrap());
+        assert_eq!(ifd.active_area, DngRect::from_corners(0, 0, 80, 100));
+
+        // MaskedAreas: 2 rects (8 values).
+        let mut stream = DngMemoryStream::new().stream();
+        for v in [0i32, 0, 10, 100, 70, 0, 80, 100] {
+            stream.put_int32(v).unwrap();
+        }
+        stream.set_read_position(0).unwrap();
+
+        assert!(ifd
+            .parse_tag(&mut host, &mut stream, 0, tcMaskedAreas, ttLong, 8, 0)
+            .unwrap());
+        assert_eq!(ifd.masked_area_count, 2);
+        assert_eq!(ifd.masked_area[0], DngRect::from_corners(0, 0, 10, 100));
+        assert_eq!(ifd.masked_area[1], DngRect::from_corners(70, 0, 80, 100));
+    }
+
+    #[test]
+    fn preview_info_tags() {
+        let mut ifd = DngIfd::new();
+        let mut host = DngHost::new();
+
+        // PreviewColorSpace = sRGB.
+        let mut stream = DngMemoryStream::new().stream();
+        stream.put_uint16(previewColorSpace_sRGB as uint16).unwrap();
+        stream.set_read_position(0).unwrap();
+        assert!(ifd
+            .parse_tag(&mut host, &mut stream, 0, tcPreviewColorSpace, ttShort, 1, 0)
+            .unwrap());
+        assert_eq!(ifd.preview_info.color_space, previewColorSpace_sRGB);
+
+        // RawToPreviewGain = 2.0.
+        let mut stream = DngMemoryStream::new().stream();
+        stream.set_big_endian(true);
+        stream.put_uint32(2).unwrap();
+        stream.put_uint32(1).unwrap();
+        stream.set_read_position(0).unwrap();
+        assert!(ifd
+            .parse_tag(&mut host, &mut stream, 0, tcRawToPreviewGain, ttRational, 1, 0)
+            .unwrap());
+        assert_eq!(ifd.preview_info.raw_to_preview_gain, 2.0);
+    }
+}

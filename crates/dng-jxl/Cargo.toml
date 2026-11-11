@@ -2,4 +2,8 @@
 name = "dng-jxl"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "JPEG XL decode (jxl-oxide) + hand-written pure-Rust modular-mode encoder for the RustDNG project"
+
 [dependencies]
+jxl-oxide = "0.11"
