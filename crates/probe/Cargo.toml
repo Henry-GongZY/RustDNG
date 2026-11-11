@@ -1,0 +1,12 @@
+[package]
+name = "probe"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+half.workspace = true
+flate2.workspace = true
+crc32fast.workspace = true
+quick-xml.workspace = true
+jpeg-encoder.workspace = true
+zune-jpeg.workspace = true
+jxl-oxide.workspace = true
