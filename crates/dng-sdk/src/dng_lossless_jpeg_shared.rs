@@ -15,8 +15,9 @@ use dng_core::dng_tags::{
     M_SOF11, M_SOF13, M_SOF14, M_SOF15, M_SOF2, M_SOF3, M_SOF5, M_SOF6, M_SOF7, M_SOF9, M_SOI,
     M_SOS, M_TEM,
 };
-use dng_core::dng_types::{int16, int32, int8, uint16, uint32, uint64, uint8};
-use dng_core::{DngError, DngResult, DngStream};
+use dng_core::dng_types::{int16, int32, int64, int8, uint16, uint32, uint64, uint8};
+use dng_core::dng_stream::DngStream;
+use dng_core::{DngError, DngResult};
 
 use crate::dng_lossless_jpeg::DngSpooler;
 
@@ -2083,7 +2084,7 @@ impl<'s> LosslessEncoder<'s> {
         for row in 0..self.src_rows as int32 {
             // Initialize predictors for this row.
 
-            let mut predictor = [0int32; 4];
+            let mut predictor = [0 as int32; 4];
 
             for channel in 0..self.src_channels as int32 {
                 if row == 0 {
@@ -2147,7 +2148,7 @@ impl<'s> LosslessEncoder<'s> {
         for row in 0..self.src_rows as int32 {
             // Initialize predictors for this row.
 
-            let mut predictor = [0int32; 4];
+            let mut predictor = [0 as int32; 4];
 
             for channel in 0..self.src_channels as int32 {
                 if row == 0 {
@@ -2377,16 +2378,14 @@ impl<'s> LosslessEncoder<'s> {
 
             let mut freq = self.freq_count[channel];
 
-            if gen_huff_coding(&mut table, &mut freq).is_err() {
+            if Self::gen_huff_coding(&mut table, &mut freq).is_err() {
                 // C++: DNG_REPORT ("Info: Reverting to default huffman table");
 
                 for (j, f) in freq.iter_mut().enumerate() {
                     *f = if j <= 16 { 1 } else { 0 };
                 }
 
-                gen_huff_coding(&mut table, &mut freq).map_err(|_| {
-                    DngError::Unknown
-                })?;
+                Self::gen_huff_coding(&mut table, &mut freq).map_err(|_| DngError::Unknown)?;
             }
 
             self.freq_count[channel] = freq;

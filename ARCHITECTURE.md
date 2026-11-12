@@ -136,3 +136,5 @@ Requirements:
 
 ## Status log
 - 2026-11-12: SDK 1.7.1 fetched from Adobe official zip; deps verified pure Rust; workspace created; ARCHITECTURE.md v1 written; agents A+B dispatched (phase 1).
+- 2026-11-12: Phase 1 DONE. dng-core complete (47 modules, 27.4k LOC, 217 tests green; stream API uses C++-faithful get_uint16/put_uint16 naming; ImageRef = Arc<RwLock<dyn DngImage>> confirmed). dng-jpeg/dng-xmp/dng-jxl complete (60 tests green; hand-written modular JXL encoder round-trips via jxl-oxide; known upstream issue: zune-jpeg misdecodes baseline RGB JPEGs with optimized Huffman tables → encode defaults optimize_coding=false). Both subagents hit subagent quota mid-session and were resumed for phase 2.
+- 2026-11-12: Phase 2 dispatched. A: dng-core retro-docs (PORTING_NOTES/DESIGN) + exif/iptc/xmp_sdk/xmp/camera_profile/hue_sat/tone_curve/gain_map/color_spec/opcode*/linearization/mosaic/negative/info. B: finish lossless_jpeg(+shared), jpeg_image, preview, big_table, bad_pixels, update_meta, bmff; batch2 (read_image/image_writer/render) later.
