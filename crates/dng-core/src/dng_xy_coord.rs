@@ -1061,10 +1061,11 @@ mod tests {
     #[test]
     fn standard_illuminants() {
         let a = DngIlluminantData::from_light(crate::dng_tag_values::lsStandardLightA, None).unwrap();
-        assert!((a.white_xy().x - 0.4476).abs() < 1e-12);
+        // SetWhiteXY quantizes through dng_urational (32768^2 denominator).
+        assert!((a.white_xy().x - 0.4476).abs() < 1e-8);
 
         let d65 = DngIlluminantData::from_light(crate::dng_tag_values::lsD65, None).unwrap();
-        assert!((d65.white_xy().x - 0.3127).abs() < 1e-12);
+        assert!((d65.white_xy().x - 0.3127).abs() < 1e-8);
         assert!(d65.is_valid());
 
         // lsOther requires other data.

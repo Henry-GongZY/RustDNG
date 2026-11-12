@@ -354,9 +354,10 @@ impl DngIfd {
             jxl_decode_speed: -1,
         };
 
-        // C++ zeroes the white level then inits to -1.0; and sets
-        // sampleFormat[0] = sfUnsignedInteger? No: C++ leaves zeros; the
-        // white level defaults come from the constructor's loop.
+        // C++ constructor: fSampleFormat[j] = sfUnsignedInteger,
+        // fBlackLevel = 0, fWhiteLevel[j] = -1.0.
+        ifd.sample_format = [sfUnsignedInteger; kMaxSamplesPerPixel as usize];
+        ifd.black_level = [[[0.0; 4]; 8]; 8];
         ifd.white_level = [-1.0; 4];
 
         ifd
@@ -1331,20 +1332,7 @@ impl DngIfd {
             self.chroma_blur_radius = DngURational::new(0, 0);
         }
 
-        // Zero out unused bits per sample entries beyond samples_per_pixel
-        // (C++ leaves them; the sample format array too).  Normalize
-        // sampleFormat for trailing planes.
-        for j in 0..kMaxSamplesPerPixel as usize {
-            if j as uint32 >= self.samples_per_pixel && j > 0 {
-                self.sample_format[j] = self.sample_format[0];
-                self.bits_per_sample[j] = self.bits_per_sample[0];
-            }
-        }
 
-        // Keep first sample format sane when unset.
-        if self.sample_format[0] == 0 {
-            self.sample_format[0] = sfUnsignedInteger;
-        }
     }
 
     /// `IsValidDNG (shared, parentCode)` — the structural checks.
@@ -2098,8 +2086,6 @@ mod tests {
         ifd.image_width = 4;
         ifd.image_length = 4;
         ifd.bits_per_sample[0] = 16;
-        ifd.bits_per_sample[1] = 16;
-        ifd.bits_per_sample[2] = 16;
         ifd.photometric_interpretation = piCFA;
         ifd.samples_per_pixel = 1;
         ifd.cfa_repeat_pattern_rows = 2;
@@ -2144,6 +2130,8 @@ mod tests {
         let mut host = DngHost::new();
         let mut stream = DngMemoryStream::new().stream();
         stream.set_little_endian(true);
+        stream.put_uint32(100).unwrap();
+        stream.set_read_position(0).unwrap();
 
         // ImageWidth = 100 (ttLong).
         assert!(ifd
@@ -2224,9 +2212,9 @@ mod tests {
         // Uncompressed: 20000 bytes, aligned.
         assert_eq!(ifd.max_image_data_byte_count().unwrap(), 20000);
 
-        // Deflate adds 0.1% + 12.
+        // Deflate adds (size >> 8) + 12 = 78 + 12.
         ifd.compression = ccDeflate;
-        assert_eq!(ifd.max_image_data_byte_count().unwrap(), 20000 + 20 + 12);
+        assert_eq!(ifd.max_image_data_byte_count().unwrap(), 20000 + 78 + 12);
 
         // Other compressions add 25% + 1024.
         ifd.compression = ccLZW;
@@ -2305,21 +2293,25 @@ mod tests {
     #[test]
     fn is_valid_dng_cfa() {
         let shared = test_shared();
-        let ifd = valid_cfa_ifd();
+        let mut ifd = valid_cfa_ifd();
+        ifd.post_parse();
         assert!(ifd.is_valid_dng(&shared, 0));
 
         // Bad CFA: pattern color not in plane color list.
         let mut bad = valid_cfa_ifd();
+        bad.post_parse();
         bad.cfa_pattern[0][0] = 7;
         assert!(!bad.is_valid_dng(&shared, 0));
 
         // Missing NewSubFileType flag.
         let mut bad2 = valid_cfa_ifd();
+        bad2.post_parse();
         bad2.uses_new_sub_file_type = false;
         assert!(!bad2.is_valid_dng(&shared, 0));
 
         // Bad tile counts.
         let mut bad3 = valid_cfa_ifd();
+        bad3.post_parse();
         bad3.tile_offsets_count = 2;
         assert!(!bad3.is_valid_dng(&shared, 0));
     }
@@ -2329,6 +2321,7 @@ mod tests {
         let shared = test_shared();
 
         let mut ifd = valid_cfa_ifd();
+        ifd.post_parse();
         ifd.photometric_interpretation = piLinearRaw;
         ifd.image_width = kMaxImageSide + 1;
         assert!(!ifd.is_valid_dng(&shared, 0));

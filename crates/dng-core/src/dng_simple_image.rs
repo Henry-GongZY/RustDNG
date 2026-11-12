@@ -192,12 +192,14 @@ impl DngImage for DngSimpleImage {
         let mut state = self.state.write().unwrap();
 
         // C++ re-anchors fData at (r.t, r.l) and rewrites bounds to origin.
-        // The Rust port re-bases the owned buffer the same way.
+        // The Rust port copies the sub-area into a fresh buffer whose area is
+        // rebased to the origin (equivalent layout).
         let new_bounds = DngRect::from_corners(0, 0, r.h() as int32, r.w() as int32);
 
-        // Build a new buffer over the sub-area.
         let old = &state.buffer;
-        let sub = sub_buffer_view(old, r)?;
+        let mut sub = sub_buffer_view(old, r)?;
+        sub.area = new_bounds;
+
         state.buffer = sub;
         state.bounds = new_bounds;
 

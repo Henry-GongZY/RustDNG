@@ -244,7 +244,7 @@ mod tests {
         assert!(safe_uint32_divide_up(1, 0).is_err());
         assert_eq!(round_up_uint32_to_multiple(10, 8).unwrap(), 16);
         assert_eq!(round_up_uint32_to_multiple(16, 8).unwrap(), 16);
-        assert!(round_up_uint32_to_multiple(u32::MAX - 1, 3).is_err()); // 4294967294/3 overflows on round-up
+        assert!(round_up_uint32_to_multiple(u32::MAX, 7).is_err()); // round-up would exceed u32::MAX
     }
 
     #[test]

@@ -2,4 +2,10 @@
 name = "dng-validate"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "dng-validate"
+path = "src/main.rs"
+
 [dependencies]
+dng-sdk = { path = "../dng-sdk" }

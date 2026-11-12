@@ -520,6 +520,16 @@ impl DngResampleTask {
     }
 }
 
+impl DngResampleTask {
+    pub fn src_area_for_debug(&self, dst_area: DngRect) -> DngResult<DngRect> {
+        self.src_area(dst_area)
+    }
+
+    pub fn src_image_handle(&self) -> std::sync::Arc<std::sync::RwLock<dyn crate::dng_image::DngImage>> {
+        self.filter.src_image.clone()
+    }
+}
+
 impl DngAreaTask for DngResampleTask {
     fn name(&self) -> &str {
         "dng_resample_task"
@@ -597,7 +607,7 @@ impl DngAreaTask for DngResampleTask {
             self.filter.src_planes,
             src_pixel_type,
             crate::dng_tag_values::pcRowInterleavedAlignSIMD,
-            DngPixelBuffer::allocate_data(src_area, self.filter.src_planes, src_pixel_type)?,
+            DngPixelBuffer::allocate_data_simd(src_area, self.filter.src_planes, src_pixel_type)?,
         )?;
 
         {
@@ -616,7 +626,7 @@ impl DngAreaTask for DngResampleTask {
             self.filter.dst_planes,
             self.filter.dst_pixel_type,
             crate::dng_tag_values::pcRowInterleavedAlignSIMD,
-            DngPixelBuffer::allocate_data(area, self.filter.dst_planes, self.filter.dst_pixel_type)?,
+            DngPixelBuffer::allocate_data_simd(area, self.filter.dst_planes, self.filter.dst_pixel_type)?,
         )?;
 
         let dst_pixel_range = {
@@ -641,37 +651,45 @@ impl DngAreaTask for DngResampleTask {
                 let src_row = (row_coord >> kResampleSubsampleBits) + offset_v;
 
                 for plane in 0..dst_buffer.planes as usize {
-                    // Down the rows into temp.
+                    // Down the rows into temp.  The C++ reads (srcRow + k,
+                    // srcArea.l + col) relative to the buffer area.
+                    let row_base =
+                        (src_row as isize - src_area.t as isize) * src_buffer.row_step as isize;
+                    let col_base = src_area.l as isize - src_buffer.area.l as isize;
                     for col in 0..src_cols as usize {
                         let mut total: real32 = 0.0;
                         for k in 0..width_v as usize {
-                            let index = ((src_row as isize + k as isize - offset_v as isize)
-                                * src_buffer.row_step as isize
-                                + col as isize) as usize;
+                            let index =
+                                (row_base + (k as isize) * src_buffer.row_step as isize
+                                    + col_base
+                                    + col as isize) as usize;
                             let v = src_buffer.data.get_f32(index);
                             total += weights_v[k] * v;
                         }
                         temp[col] = total;
                     }
 
-                    // Across into the destination.
+                    // Across into the destination.  ttPtr = tPtr +
+                    // (offsetH - srcArea.l); reads ttPtr[sPixel + k].
+                    let dst_col_base = area.l as isize - dst_buffer.area.l as isize;
                     for j in 0..dst_cols as usize {
                         let coord = self.col_coords.coords(area.l)[j];
 
                         let s_fract = (coord as uint32) & kResampleSubsampleMask;
-                        let s_pixel = (coord >> kResampleSubsampleBits) as usize;
+                        let s_pixel = coord >> kResampleSubsampleBits;
 
                         let w = &weights_h[s_fract as usize * step_h as usize..];
 
                         let mut total: real32 = 0.0;
                         for k in 0..width_h as usize {
-                            let idx = (offset_h - src_area.l) as isize + (s_pixel + k) as isize;
+                            let idx = (offset_h - src_area.l) as isize + (s_pixel as isize) + (k as isize);
                             let v = temp[idx as usize];
                             total += w[k] * v;
                         }
 
-                        let di = (dst_row as isize - area.t as isize)
+                        let di = (dst_row as isize - dst_buffer.area.t as isize)
                             * dst_buffer.row_step as isize
+                            + dst_col_base
                             + j as isize;
                         dst_buffer
                             .data
@@ -700,12 +718,16 @@ impl DngAreaTask for DngResampleTask {
 
                 for plane in 0..dst_buffer.planes as usize {
                     // Down the rows into temp (16-bit fixed point).
+                    let row_base =
+                        (src_row as isize - src_area.t as isize) * src_buffer.row_step as isize;
+                    let col_base = src_area.l as isize - src_buffer.area.l as isize;
                     for col in 0..src_cols as usize {
                         let mut total: int32 = 8192;
                         for k in 0..width_v as usize {
-                            let index = ((src_row as isize + k as isize - offset_v as isize)
-                                * src_buffer.row_step as isize
-                                + col as isize) as usize;
+                            let index =
+                                (row_base + (k as isize) * src_buffer.row_step as isize
+                                    + col_base
+                                    + col as isize) as usize;
                             let v = src_buffer.data.get_u16(index) as int32;
                             total += weights_v[k] as int32 * v;
                         }
@@ -713,24 +735,26 @@ impl DngAreaTask for DngResampleTask {
                             as uint16;
                     }
 
-                    // Across into the destination.
+                    // Across into the destination (16-bit fixed point).
+                    let dst_col_base = area.l as isize - dst_buffer.area.l as isize;
                     for j in 0..dst_cols as usize {
                         let coord = self.col_coords.coords(area.l)[j];
 
                         let s_fract = (coord as uint32) & kResampleSubsampleMask;
-                        let s_pixel = (coord >> kResampleSubsampleBits) as usize;
+                        let s_pixel = coord >> kResampleSubsampleBits;
 
                         let w = &weights_h[s_fract as usize * step_h as usize..];
 
                         let mut total: int32 = 0;
                         for k in 0..width_h as usize {
-                            let idx = (offset_h - src_area.l) as isize + (s_pixel + k) as isize;
+                            let idx = (offset_h - src_area.l) as isize + (s_pixel as isize) + (k as isize);
                             let v = temp[idx as usize] as int32;
                             total += w[k] as int32 * v;
                         }
 
-                        let di = (dst_row as isize - area.t as isize)
+                        let di = (dst_row as isize - dst_buffer.area.t as isize)
                             * dst_buffer.row_step as isize
+                            + dst_col_base
                             + j as isize;
                         dst_buffer.data.set_u16(
                             di as usize,

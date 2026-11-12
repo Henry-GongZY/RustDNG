@@ -495,9 +495,15 @@ impl DngShared {
 
             x if x == tcAsShotNeutral => {
                 check_tag_type(parent_code, tag_code, tag_type, &[ttRational as uint16]);
-                if !check_color_image(parent_code, tag_code, shared_color_planes_hack(
-                    self.camera_profile.color_planes, tag_count,
-                )) {
+
+                // Kludge - Hasselblad FFF files are very DNG-like, but
+                // sometimes they have no ColorMatrix tags.
+                if self.dng_version == 0 && self.camera_profile.color_planes == 0 {
+                    self.camera_profile.color_planes =
+                        crate::dng_utils::pin_uint32(0, tag_count, crate::dng_sdk_limits::kMaxColorPlanes);
+                }
+
+                if !check_color_image(parent_code, tag_code, self.camera_profile.color_planes) {
                     return Ok(false);
                 }
                 self.as_shot_neutral = parse_vector_tag(

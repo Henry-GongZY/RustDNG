@@ -1125,10 +1125,17 @@ mod tests {
 
     #[test]
     fn utf8_repair() {
-        // Invalid continuation becomes replacement char.
+        // 0xFF is a 6-byte lead; with only 2 bytes left the C++ DecodeUTF8
+        // advances by maxBytes (consuming the 'B') and emits one replacement.
         let mut s = DngString::new();
         s.set_utf8(&[b'A', 0xFF, b'B']);
-        assert_eq!(s.get(), "A\u{FFFD}B".as_bytes());
+        assert_eq!(s.get(), "A\u{FFFD}".as_bytes());
+
+        // A truncated 2-byte sequence also consumes the following byte
+        // (the C++ continuation check advances past the whole sequence).
+        let mut t = DngString::new();
+        t.set_utf8(&[b'A', 0xC3, b'B']);
+        assert_eq!(t.get(), "A\u{FFFD}".as_bytes());
     }
 
     #[test]
@@ -1144,9 +1151,15 @@ mod tests {
 
     #[test]
     fn truncate_keeps_utf8_boundaries() {
+        // 日本語 = 9 bytes.  truncate(5) would cut inside 本; the C++
+        // algorithm backs up to the last leading byte -> keeps 日.
         let mut s = DngString::from_bytes("日本語".as_bytes());
         s.truncate(5);
-        assert_eq!(s.get(), "日本".as_bytes());
+        assert_eq!(s.get(), "日".as_bytes());
+        // Full-character cut keeps both.
+        let mut t = DngString::from_bytes("日本語".as_bytes());
+        t.truncate(6);
+        assert_eq!(t.get(), "日本".as_bytes());
     }
 
     #[test]
@@ -1175,7 +1188,7 @@ mod tests {
 
         let mut s = DngString::from_bytes("café © «ok»".as_bytes());
         s.force_ascii();
-        assert_eq!(s.get(), b"caf\xc3? (C) <<ok>>");
+        assert_eq!(s.get(), b"cafe (C) <<ok>>");
     }
 
     #[test]
@@ -1203,9 +1216,12 @@ mod tests {
         // Without digits-as-number, "10" < "9".
         assert_eq!(a.compare(&b, false), -1);
 
+        // The C++ fallback does a case-sensitive second pass, so case-only
+        // differences compare by code point ("A" < "a").
         let c = DngString::from_bytes(b"ABC");
         let d = DngString::from_bytes(b"abc");
-        assert_eq!(c.compare(&d, false), 0);
+        assert_eq!(c.compare(&d, false), -1);
+        assert_eq!(c.compare(&c, false), 0);
     }
 
     #[test]

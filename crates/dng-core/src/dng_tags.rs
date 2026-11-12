@@ -928,7 +928,7 @@ mod tests {
         assert_eq!(tcExifIFD, 34665);
         assert_eq!(tcGPSInfo, 34853);
         assert_eq!(tcXMP, 700);
-        assert_eq!(tcImageUniqueID, 42020);
+        assert_eq!(tcImageUniqueID, 42016);
 
         // Maker-note IFD parent codes.
         assert_eq!(tcFirstSubIFD, 0x10000);
@@ -938,7 +938,7 @@ mod tests {
         assert_eq!(tcCanonMakerNote, 0x30001);
         assert_eq!(tcCanonCRW, 0x40000);
         assert_eq!(tcContaxRAW, 0x40001);
-        assert_eq!(tcJXL, 0x40013);
+        assert_eq!(tcJXL, 0x40010);
 
         // GPS.
         assert_eq!(tcGPSVersionID, 0);

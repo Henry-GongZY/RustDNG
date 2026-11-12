@@ -864,8 +864,10 @@ mod tests {
         assert_eq!(stream.get_uint32().unwrap(), 1);
         assert_eq!(stream.get_uint32().unwrap(), 0);
 
-        // Second entry.
+        // Second entry: code, type, count, inline value.
         assert_eq!(stream.get_uint16().unwrap(), tcImageWidth as uint16);
+        assert_eq!(stream.get_uint16().unwrap(), ttLong as uint16);
+        assert_eq!(stream.get_uint32().unwrap(), 1);
         assert_eq!(stream.get_uint32().unwrap(), 1920);
 
         // Third entry: uint16 inline.

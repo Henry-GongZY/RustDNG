@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn date_time_tag() {
         let mut stream = DngMemoryStream::new().stream();
-        stream.put(b"2003:08:13 18:34:51").unwrap();
+        stream.put(b"2003:08:13 18:34:51\0").unwrap();
         stream.set_read_position(0).unwrap();
 
         let mut dt = DngDateTime::new();

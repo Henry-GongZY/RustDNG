@@ -346,7 +346,7 @@ impl DngFilterTaskBase {
             self.src_planes,
             self.src_pixel_type,
             crate::dng_tag_values::pcRowInterleavedAlignSIMD,
-            DngPixelBuffer::allocate_data(src_area, self.src_planes, self.src_pixel_type)?,
+            DngPixelBuffer::allocate_data_simd(src_area, self.src_planes, self.src_pixel_type)?,
         )?;
 
         {
@@ -366,7 +366,7 @@ impl DngFilterTaskBase {
             self.dst_planes,
             self.dst_pixel_type,
             crate::dng_tag_values::pcRowInterleavedAlignSIMD,
-            DngPixelBuffer::allocate_data(area, self.dst_planes, self.dst_pixel_type)?,
+            DngPixelBuffer::allocate_data_simd(area, self.dst_planes, self.dst_pixel_type)?,
         )?;
 
         process_area(thread_index, &mut src_buffer, &mut dst_buffer)?;

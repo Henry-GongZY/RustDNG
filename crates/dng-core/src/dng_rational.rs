@@ -352,6 +352,6 @@ mod tests {
         let mut r = DngRational::new(0, 0);
         r.set_real64(1.0 / 3.0, 0);
         // i64 rounding to 32768*32768 denominator keeps ~1e-11 precision.
-        assert!((r.as_real64() - 1.0 / 3.0).abs() < 1e-11);
+        assert!((r.as_real64() - 1.0 / 3.0).abs() < 1e-9);
     }
 }

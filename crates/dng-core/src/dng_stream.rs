@@ -1340,7 +1340,7 @@ mod tests {
         assert_eq!(s.get_real32().unwrap(), 1.5);
         assert_eq!(s.get_real64().unwrap(), 2.5);
         assert_eq!(s.get_c_string(16).unwrap(), b"hello");
-        assert_eq!(s.position(), 53); // 1+1+2+2+4+4+8+8+4+8+6+5
+        assert_eq!(s.position(), 48); // reads: 1+1+2+2+4+4+8+8+4+8+6
     }
 
     #[test]
@@ -1356,7 +1356,7 @@ mod tests {
         s.put_real64(2.5).unwrap();
         s.flush().unwrap();
 
-        let data = s.data().unwrap().to_vec();
+        let data = s.as_memory_block().unwrap().buffer().to_vec();
         assert_eq!(&data[0..2], &[0x12, 0x34]);
         assert_eq!(&data[2..6], &[0x12, 0x34, 0x56, 0x78]);
 
@@ -1459,6 +1459,7 @@ mod tests {
         assert_eq!(s.tag_value_real64(ttShort).unwrap(), 3.0);
 
         // ttRational 1/2
+        s.set_write_position(0).unwrap();
         s.put_uint32(1).unwrap();
         s.put_uint32(2).unwrap();
         s.set_read_position(0).unwrap();
@@ -1468,6 +1469,7 @@ mod tests {
         assert_eq!(s.tag_value_real64(ttRational).unwrap(), 0.5);
 
         // ttSRational -1/2
+        s.set_write_position(0).unwrap();
         s.put_int32(-1).unwrap();
         s.put_int32(2).unwrap();
         s.set_read_position(0).unwrap();
@@ -1475,6 +1477,7 @@ mod tests {
         assert_eq!((r.n, r.d), (-1, 2));
 
         // ttFloat 0.25
+        s.set_write_position(0).unwrap();
         s.put_real32(0.25).unwrap();
         s.set_read_position(0).unwrap();
         assert_eq!(s.tag_value_real64(ttFloat).unwrap(), 0.25);

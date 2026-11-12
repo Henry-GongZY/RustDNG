@@ -1003,14 +1003,14 @@ mod tests {
         let s = vec![0u8, 255, 128];
         let mut d = vec![0i16; 3];
         copy_area8_s16(&s, 0, &mut d, 0, 1, 3, 1, 1, 1, 1, 1, 1, 1);
-        assert_eq!(d[0], i16::from_le_bytes([0x80, 0x80]));
+        assert_eq!(d[0], 0x8000u16 as i16); // 0 ^ 0x8000
         assert_eq!((d[1] as u16) ^ 0x8000, 0xFF);
     }
 
     #[test]
     fn resample_down16_sums() {
         // Two rows of identical value 100, weights [8192, 8192] -> 100.
-        let s = vec![100u16; 8];
+        let s = vec![100u16; 16]; // two rows
         let w = vec![8192i16, 8192];
         let mut d = vec![0u16; 8];
         resample_down16(&s, 0, &mut d, 0, 8, 8, &w, 2, 65535);
@@ -1057,10 +1057,13 @@ mod tests {
 
     #[test]
     fn repeat_area8_works() {
+        // Source is one 1x2 row [7 8]; dest is 2x2 with repeat_v=1,
+        // repeat_h=2 (phase 0,0): each dest row copies the source row.
         let s = vec![7u8, 8];
         let mut d = vec![0u8; 4];
-        // 2x2 dest from 1x2 source with repeat 1x2.
-        repeat_area8(&s, 0, &mut d, 0, 2, 2, 1, 2, 1, 1, 1, 2, 1, 0);
+        // The C++ RefRepeatArea8 uses ONE step set for both src and dst:
+        // dest is 2x2 (row_step 2), the 1-row source wraps every row.
+        repeat_area8(&s, 0, &mut d, 0, 2, 2, 1, 2, 1, 1, 1, 2, 0, 0);
         assert_eq!(d, vec![7, 8, 7, 8]);
     }
 }

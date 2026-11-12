@@ -1680,7 +1680,7 @@ mod tests {
         assert_eq!(dng_half_to_float(0x3C00), 0x3F800000); // 1.0
         assert_eq!(dng_half_to_float(0x0000), 0); // +0
         assert_eq!(dng_half_to_float(0x8000), 0x80000000); // -0
-        assert_eq!(dng_half_to_float(0x7C00), 0x7F800000 | 0x3FF << 13); // +inf -> max
+        assert_eq!(dng_half_to_float(0x7C00), ((0x1e + 127 - 15) << 23) | (0x3ff << 13)); // +inf -> max 16-bit values
         assert_eq!(dng_half_to_float(0x7E00), 0); // NaN -> 0
     }
 

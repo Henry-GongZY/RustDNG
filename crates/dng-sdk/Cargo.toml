@@ -2,4 +2,12 @@
 name = "dng-sdk"
 version = "0.1.0"
 edition = "2021"
+
 [dependencies]
+dng-core = { path = "../dng-core" }
+dng-jpeg = { path = "../dng-jpeg" }
+dng-jxl = { path = "../dng-jxl" }
+dng-xmp = { path = "../dng-xmp" }
+half.workspace = true
+flate2.workspace = true
+crc32fast.workspace = true

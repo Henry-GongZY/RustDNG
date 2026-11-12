@@ -895,8 +895,8 @@ mod tests {
         // Invert pseudo path requires Transpose(A)*A to be non-singular).
         let a = DngMatrix::from_rows(3, 2, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
         let pinv = a.inverted().unwrap();
-        assert_eq!(pinv.rows(), 3);
-        assert_eq!(pinv.cols(), 2);
+        assert_eq!(pinv.rows(), 2);
+        assert_eq!(pinv.cols(), 3);
         // Verify A * pinv * A == A.
         let check = a.multiply(&pinv).unwrap().multiply(&a).unwrap();
         assert!(check.almost_equal(&a, 1e-9));

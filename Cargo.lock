@@ -113,10 +113,22 @@ dependencies = [
 [[package]]
 name = "dng-sdk"
 version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "dng-core",
+ "dng-jpeg",
+ "dng-jxl",
+ "dng-xmp",
+ "flate2",
+ "half",
+]
 
 [[package]]
 name = "dng-validate"
 version = "0.1.0"
+dependencies = [
+ "dng-sdk",
+]
 
 [[package]]
 name = "dng-xmp"

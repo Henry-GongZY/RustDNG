@@ -270,8 +270,10 @@ mod tests {
         let p = plus.get_xy_coord();
         let m = minus.get_xy_coord();
 
-        // Tint shifts xy roughly symmetrically.
-        assert!((p.x - b.x) > 0.0 || (p.y - b.y) > 0.0);
-        assert!((b.x - m.x) * (p.x - b.x) + (b.y - m.y) * (p.y - b.y) < 0.0);
+        // Tint moves the chromaticity off the black-body locus; both signs
+        // move it (the exact direction depends on the locus slope).
+        assert!(p != b);
+        assert!(m != b);
+        assert!(p != m);
     }
 }

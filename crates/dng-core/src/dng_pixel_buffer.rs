@@ -362,6 +362,36 @@ impl DngPixelBuffer {
         Self::with_planar_config(area, plane, planes, pixel_type, pcInterleaved, data)
     }
 
+    /// Allocate for a `pcRowInterleavedAlignSIMD` buffer (row step padded to
+    /// the SIMD multiple, matching `ComputeBufferSize (..., padSIMDBytes)`).
+    pub fn allocate_data_simd(
+        area: DngRect,
+        planes: uint32,
+        pixel_type: uint32,
+    ) -> DngResult<PixelData> {
+        let bytes = crate::dng_utils::compute_buffer_size(
+            pixel_type,
+            area.size(),
+            planes,
+            crate::dng_utils::PaddingType::padSIMDBytes,
+        )?;
+        let pixels = (bytes / tag_type_size(pixel_type).max(1)) as usize;
+        Ok(match pixel_type {
+            ttByte | ttAscii | ttUndefined => PixelData::U8(vec![0; bytes as usize]),
+            ttSByte => PixelData::I8(vec![0; bytes as usize]),
+            ttShort | ttUnicode => PixelData::U16(vec![0; pixels]),
+            ttSShort => PixelData::I16(vec![0; pixels]),
+            ttLong | ttIFD => PixelData::U32(vec![0; pixels]),
+            ttSLong => PixelData::I32(vec![0; pixels]),
+            ttLong8 => PixelData::U64(vec![0; pixels]),
+            ttSLong8 => PixelData::I64(vec![0; pixels]),
+            ttHalfFloat => PixelData::F16(vec![f16::ZERO; pixels]),
+            ttFloat => PixelData::F32(vec![0.0; pixels]),
+            ttDouble => PixelData::F64(vec![0.0; pixels]),
+            _ => return Err(not_yet_implemented()),
+        })
+    }
+
     /// Allocate a zero-filled data vector sized for the buffer geometry.
     pub fn allocate_data(area: DngRect, planes: uint32, pixel_type: uint32) -> DngResult<PixelData> {
         let bytes = crate::dng_utils::compute_buffer_size(
@@ -1307,11 +1337,13 @@ mod tests {
         let dst_area = rect(0, 0, 4, 4);
         buf.repeat_area(src_area, dst_area).unwrap();
 
-        // Pattern must tile across the whole buffer.
+        // Pattern tiles with the phase computed by RepeatPhase: the first
+        // dst pixel reads src(2,2).  Row 0 is all 7; odd rows alternate
+        // 9,7,9,7 (src(1,2)=9, src(1,1)=7).
         for row in 0..4 {
             for col in 0..4 {
                 let v = buf.const_pixel_u8(row, col, 0).unwrap();
-                let expect = if (row % 2 == 1) && (col % 2 == 1) { 7 } else { 9 };
+                let expect = if row % 2 == 1 && col % 2 == 0 { 9 } else { 7 };
                 assert_eq!(v, expect, "row={row} col={col}");
             }
         }
@@ -1359,7 +1391,7 @@ mod tests {
         v.dirty_pixel_u8(0, 0, 0, 11).unwrap();
         v.dirty_pixel_u8(1, 0, 0, 22).unwrap();
         v.flip_v().unwrap();
-        assert_eq!(v.row_step, -1);
+        assert_eq!(v.row_step, -3); // row_step == -(area width)
         assert_eq!(v.const_pixel_u8(1, 0, 0).unwrap(), 11);
         assert_eq!(v.const_pixel_u8(0, 0, 0).unwrap(), 22);
     }
@@ -1394,8 +1426,11 @@ mod tests {
 
         b.repeat_sub_area(rect(1, 1, 3, 3), 1, 1).unwrap();
 
-        assert_eq!(b.const_pixel_u8(0, 0, 0).unwrap(), 1); // corner = (1,1)
-        assert_eq!(b.const_pixel_u8(0, 1, 0).unwrap(), 2);
+        // After top/bottom row repeats and left/right column repeats:
+        // rows 0-1 = [1,1,2,2], rows 2-3 = [3,3,4,4].
+        assert_eq!(b.const_pixel_u8(0, 0, 0).unwrap(), 1);
+        assert_eq!(b.const_pixel_u8(0, 1, 0).unwrap(), 1);
+        assert_eq!(b.const_pixel_u8(0, 2, 0).unwrap(), 2);
         assert_eq!(b.const_pixel_u8(3, 2, 0).unwrap(), 4);
         assert_eq!(b.const_pixel_u8(2, 3, 0).unwrap(), 4);
     }

@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(tiles[0], DngRect::from_corners(5, 5, 8, 8));
         assert_eq!(tiles[1], DngRect::from_corners(5, 8, 8, 12));
         assert_eq!(tiles[2], DngRect::from_corners(5, 12, 8, 15));
-        assert_eq!(tiles[8], DngRect::from_corners(13, 13, 15, 15));
+        assert_eq!(tiles[8], DngRect::from_corners(12, 12, 15, 15));
     }
 
     #[test]
