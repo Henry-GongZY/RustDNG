@@ -34,7 +34,7 @@ pub const qSupportHasselblad_3FR: bool = true;
 
 /// One structure per Huffman coding table; shared between encoding and
 /// decoding (`struct HuffmanTable`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HuffmanTable {
     /// Contents of a JPEG DHT marker (`bits[17]`).
     pub bits: [uint8; 17],
@@ -51,6 +51,22 @@ pub struct HuffmanTable {
     /// Derived encoding tables.
     pub ehufco: [uint16; 256],
     pub ehufsi: [int8; 256],
+}
+
+impl Default for HuffmanTable {
+    fn default() -> Self {
+        HuffmanTable {
+            bits: [0; 17],
+            huffval: [0; 256],
+            mincode: [0; 17],
+            maxcode: [0; 18],
+            valptr: [0; 17],
+            numbits: [0; 256],
+            value: [0; 256],
+            ehufco: [0; 256],
+            ehufsi: [0; 256],
+        }
+    }
 }
 
 impl HuffmanTable {
@@ -266,8 +282,8 @@ impl Default for DecompressInfo {
 // ---------------------------------------------------------------------------
 
 /// Port of `dng_lossless_decoder<simd>` (Scalar specialization).
-pub struct LosslessDecoder<'s, S: DngSpooler + ?Sized> {
-    stream: &'s mut DngStream<'static>,
+pub struct LosslessDecoder<'s, 'a, S: DngSpooler + ?Sized> {
+    stream: &'s mut DngStream<'a>,
     spooler: &'s mut S,
     /// Decode data with the "16-bit" bug (`fBug16`).
     bug16: bool,
@@ -295,8 +311,8 @@ pub struct LosslessDecoder<'s, S: DngSpooler + ?Sized> {
     hasselblad_3fr: bool,
 }
 
-impl<'s, S: DngSpooler + ?Sized> LosslessDecoder<'s, S> {
-    pub fn new(stream: &'s mut DngStream<'static>, spooler: &'s mut S, bug16: bool) -> Self {
+impl<'s, 'a, S: DngSpooler + ?Sized> LosslessDecoder<'s, 'a, S> {
+    pub fn new(stream: &'s mut DngStream<'a>, spooler: &'s mut S, bug16: bool) -> Self {
         LosslessDecoder {
             stream,
             spooler,
@@ -316,6 +332,12 @@ impl<'s, S: DngSpooler + ?Sized> LosslessDecoder<'s, S> {
     /// `IsHasselblad3FR ()`.
     pub fn is_hasselblad_3fr(&self) -> bool {
         self.hasselblad_3fr
+    }
+
+    /// Stream position accessor (lets callers read `stream.Position ()`
+    /// while the decoder still holds the mutable borrow).
+    pub fn stream_position(&self) -> uint64 {
+        self.stream.position()
     }
 
     // -- marker stream helpers ----------------------------------------------
@@ -362,24 +384,32 @@ impl<'s, S: DngSpooler + ?Sized> LosslessDecoder<'s, S> {
                 self.huff_tables[index] = Some(Box::new(HuffmanTable::new()));
             }
 
-            let table = self.huff_tables[index].as_mut().unwrap();
+            // PORT-NOTE: read all bytes first, then update the table, to
+            // satisfy the borrow checker (the C++ interleaves the reads).
 
-            table.bits[0] = 0;
+            let mut bits = [0u8; 17];
 
             let mut count: int32 = 0;
 
             for i in 1..=16usize {
-                table.bits[i] = self.get_jpeg_char()? as uint8;
-                count += table.bits[i] as int32;
+                bits[i] = self.get_jpeg_char()? as uint8;
+                count += bits[i] as int32;
             }
 
             if count > 256 {
                 return Err(bad_format());
             }
 
+            let mut huffval = [0u8; 256];
+
             for j in 0..count as usize {
-                table.huffval[j] = self.get_jpeg_char()? as uint8;
+                huffval[j] = self.get_jpeg_char()? as uint8;
             }
+
+            let table = self.huff_tables[index].as_mut().unwrap();
+
+            table.bits = bits;
+            table.huffval = huffval;
 
             length -= 1 + 16 + count;
         }
@@ -829,34 +859,6 @@ impl<'s, S: DngSpooler + ?Sized> LosslessDecoder<'s, S> {
         col * self.comps_in_scan_stride + comp
     }
 
-    /// Calculate the predictor for sample `cur_row[col][cur_comp]`
-    /// (`QuickPredict`) — does not handle image-edge special cases.
-    #[inline]
-    fn quick_predict(
-        &self,
-        col: usize,
-        cur_comp: usize,
-        cur_row: &[uint16],
-        prev_row: &[uint16],
-    ) -> DngResult<int32> {
-        let stride = self.comps_in_scan_stride;
-
-        let diag = prev_row[(col - 1) * stride + cur_comp] as int32;
-        let upper = prev_row[col * stride + cur_comp] as int32;
-        let left = cur_row[(col - 1) * stride + cur_comp] as int32;
-
-        match self.info.ss {
-            0 => Ok(0),
-            1 => Ok(left),
-            2 => Ok(upper),
-            3 => Ok(diag),
-            4 => Ok(left + upper - diag),
-            5 => Ok(left + ((upper - diag) >> 1)),
-            6 => Ok(upper + ((left - diag) >> 1)),
-            7 => Ok((left + upper) >> 1),
-            _ => Err(bad_format()),
-        }
-    }
 
     // -- bit buffer -------------------------------------------------------------
 
@@ -1037,8 +1039,8 @@ impl<'s, S: DngSpooler + ?Sized> LosslessDecoder<'s, S> {
             Ok(0) // fake a zero as the safest result
         } else {
             let table = self.huff_tables[tbl_index].as_ref().unwrap();
-            Ok(table.huffval[(table.valptr[l] + (code as int32 - table.mincode[l] as int32))
-                as usize] as int32)
+            let idx = table.valptr[l] as int32 + (code as int32 - table.mincode[l] as int32);
+            Ok(table.huffval[idx as usize] as int32)
         }
     }
 
@@ -1314,19 +1316,22 @@ impl<'s, S: DngSpooler + ?Sized> LosslessDecoder<'s, S> {
                 let mut prev1 = self.mcu_row2[self.row_index(0, 1)] as int32;
 
                 for col in 1..num_col {
-                    let s = self.huff_decode(ht[0])?;
+                    // C++: decode difference once (HuffDecode + extend) and
+                    // add to the running left value.
 
-                    if s != 0 {
-                        let d = self.decode_diff_generic(ht[0])?;
-                        prev0 += d;
+                    let d = self.decode_diff_generic(ht[0])?;
+
+                    if d != 0 || true {
+                        // decode_diff_generic returns the full difference
+                        // value d (already extended); when s == 0 it is 0,
+                        // so adding it unconditionally matches the C++.
                     }
 
-                    let s = self.huff_decode(ht[1])?;
+                    prev0 += d;
 
-                    if s != 0 {
-                        let d = self.decode_diff_generic(ht[1])?;
-                        prev1 += d;
-                    }
+                    let d = self.decode_diff_generic(ht[1])?;
+
+                    prev1 += d;
 
                     let idx0 = self.row_index(col, 0);
                     let idx1 = self.row_index(col, 1);
@@ -1343,10 +1348,23 @@ impl<'s, S: DngSpooler + ?Sized> LosslessDecoder<'s, S> {
 
                         // Predict the pixel value.
 
-                        let (cur_row, prev_row) = (&self.mcu_row2, &self.mcu_row1);
+                        let stride = self.comps_in_scan_stride;
 
-                        let predictor =
-                            self.quick_predict(col, cur_comp, cur_row, prev_row)?;
+                        let diag = self.mcu_row1[(col - 1) * stride + cur_comp] as int32;
+                        let upper = self.mcu_row1[col * stride + cur_comp] as int32;
+                        let left = self.mcu_row2[(col - 1) * stride + cur_comp] as int32;
+
+                        let predictor = match self.info.ss {
+                            0 => 0,
+                            1 => left,
+                            2 => upper,
+                            3 => diag,
+                            4 => left + upper - diag,
+                            5 => left + ((upper - diag) >> 1),
+                            6 => upper + ((left - diag) >> 1),
+                            7 => (left + upper) >> 1,
+                            _ => return Err(bad_format()),
+                        };
 
                         // Save the difference.
 
@@ -1770,7 +1788,7 @@ impl<'s, S: DngSpooler + ?Sized> LosslessDecoder<'s, S> {
 // ---------------------------------------------------------------------------
 
 /// Port of `dng_lossless_encoder<simd>` (Scalar specialization).
-pub struct LosslessEncoder<'s> {
+pub struct LosslessEncoder<'s, 'a> {
     /// Source samples (`fSrcData`); addressed as
     /// `src_data[(row * row_step + col * col_step + channel) as usize]`.
     src_data: &'s [uint16],
@@ -1783,7 +1801,7 @@ pub struct LosslessEncoder<'s> {
     src_row_step: int32,
     src_col_step: int32,
 
-    stream: &'s mut DngStream<'static>,
+    stream: &'s mut DngStream<'a>,
 
     huff_table: [HuffmanTable; 4],
 
@@ -1800,7 +1818,7 @@ pub struct LosslessEncoder<'s> {
     stream_buffer: Vec<uint8>,
 }
 
-impl<'s> LosslessEncoder<'s> {
+impl<'s, 'a> LosslessEncoder<'s, 'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         src_data: &'s [uint16],
@@ -1810,17 +1828,21 @@ impl<'s> LosslessEncoder<'s> {
         src_bit_depth: uint32,
         src_row_step: int32,
         src_col_step: int32,
-        stream: &'s mut DngStream<'static>,
+        stream: &'s mut DngStream<'a>,
     ) -> Self {
         // Initialize number of bits lookup table.
 
-        let mut num_bits_table = [0int32; 256];
+        let mut num_bits_table = [0 as int32; 256];
 
         for i in 1..256usize {
             let mut temp = i;
             let mut nbits = 1;
 
-            while temp >>= 1 {
+            loop {
+                temp >>= 1;
+                if temp == 0 {
+                    break;
+                }
                 nbits += 1;
             }
 
@@ -1931,7 +1953,7 @@ impl<'s> LosslessEncoder<'s> {
 
     /// Count the difference value in countTable (`CountOneDiff`).
     #[inline]
-    fn count_one_diff(&self, diff: int32, count_table: &mut [uint32; 257]) {
+    fn count_one_diff(num_bits_table: &[int32; 256], diff: int32, count_table: &mut [uint32; 257]) {
         // Encode the DC coefficient difference per section F.1.2.1
 
         let mut temp = diff;
@@ -1943,9 +1965,9 @@ impl<'s> LosslessEncoder<'s> {
         // Find the number of bits needed for the magnitude of the coefficient
 
         let nbits = if temp >= 256 {
-            self.num_bits_table[(temp >> 8) as usize] + 8
+            num_bits_table[(temp >> 8) as usize] + 8
         } else {
-            self.num_bits_table[(temp & 0xFF) as usize]
+            num_bits_table[(temp & 0xFF) as usize]
         };
 
         // Update count for this bit length
@@ -2090,8 +2112,10 @@ impl<'s> LosslessEncoder<'s> {
                 if row == 0 {
                     predictor[channel as usize] = 1 << (self.src_bit_depth - 1);
                 } else {
+                    // C++: predictor[channel] = sPtr[channel - fSrcRowStep]
+                    // (previous row, column 0, same channel).
                     predictor[channel as usize] =
-                        self.sample(row, 0, channel - self.src_channels as int32)? as int32;
+                        self.sample(row, 0, channel - self.src_row_step)? as int32;
                 }
             }
 
@@ -2108,8 +2132,8 @@ impl<'s> LosslessEncoder<'s> {
                     let diff0 = (pixel0 - pred0) as int16;
                     let diff1 = (pixel1 - pred1) as int16;
 
-                    self.count_one_diff(diff0 as int32, &mut self.freq_count[0]);
-                    self.count_one_diff(diff1 as int32, &mut self.freq_count[1]);
+                    Self::count_one_diff(&self.num_bits_table, diff0 as int32, &mut self.freq_count[0]);
+                    Self::count_one_diff(&self.num_bits_table, diff1 as int32, &mut self.freq_count[1]);
 
                     pred0 = pixel0;
                     pred1 = pixel1;
@@ -2124,7 +2148,7 @@ impl<'s> LosslessEncoder<'s> {
                         let diff = (pixel - predictor[channel as usize]) as int16;
 
                         let ch = channel as usize;
-                        self.count_one_diff(diff as int32, &mut self.freq_count[ch]);
+                        Self::count_one_diff(&self.num_bits_table, diff as int32, &mut self.freq_count[ch]);
 
                         predictor[channel as usize] = pixel;
                     }
@@ -2154,8 +2178,10 @@ impl<'s> LosslessEncoder<'s> {
                 if row == 0 {
                     predictor[channel as usize] = 1 << (self.src_bit_depth - 1);
                 } else {
+                    // C++: predictor[channel] = sPtr[channel - fSrcRowStep]
+                    // (previous row, column 0, same channel).
                     predictor[channel as usize] =
-                        self.sample(row, 0, channel - self.src_channels as int32)? as int32;
+                        self.sample(row, 0, channel - self.src_row_step)? as int32;
                 }
             }
 
@@ -2412,14 +2438,19 @@ impl<'s> LosslessEncoder<'s> {
 
     /// Emit a DHT marker, followed by the Huffman data (`EmitDht`).
     fn emit_dht(&mut self, index: usize) {
-        let htbl = &self.huff_table[index];
+        // PORT-NOTE: copy the table fields up front to satisfy the borrow
+        // checker (the C++ interleaves reads from the table with writes to
+        // the output buffer).
+
+        let bits = self.huff_table[index].bits;
+        let huffval = self.huff_table[index].huffval;
 
         self.emit_marker(M_DHT);
 
         let mut length = 0u32;
 
         for i in 1..=16usize {
-            length += htbl.bits[i] as u32;
+            length += bits[i] as u32;
         }
 
         self.emit2bytes((length + 2 + 1 + 16) as int32);
@@ -2427,11 +2458,11 @@ impl<'s> LosslessEncoder<'s> {
         self.emit_byte(index as uint8);
 
         for i in 1..=16usize {
-            self.emit_byte(htbl.bits[i]);
+            self.emit_byte(bits[i]);
         }
 
         for i in 0..length as usize {
-            self.emit_byte(htbl.huffval[i]);
+            self.emit_byte(huffval[i]);
         }
     }
 
@@ -2469,7 +2500,7 @@ impl<'s> LosslessEncoder<'s> {
             // Cs,Td,Ta
 
             self.emit_byte(i as uint8);
-            self.emit_byte(i << 4);
+            self.emit_byte((i << 4) as uint8);
         }
 
         self.emit_byte(1); // PSV - hardcoded - tknoll
@@ -2534,3 +2565,5 @@ impl<'s> LosslessEncoder<'s> {
         Ok(())
     }
 }
+
+

@@ -163,6 +163,13 @@ impl DngMatrix {
         m
     }
 
+    /// `scale * A` (returns a scaled copy; the C++ free `operator*`).
+    pub fn scaled(&self, factor: real64) -> DngResult<DngMatrix> {
+        let mut b = *self;
+        b.scale(factor);
+        Ok(b)
+    }
+
     /// `Scale (factor)`.
     pub fn scale(&mut self, factor: real64) {
         for j in 0..self.rows as usize {
@@ -305,6 +312,11 @@ impl DngMatrix {
 pub struct DngMatrix3by3(pub DngMatrix);
 
 impl DngMatrix3by3 {
+    /// Element setter (C++ `A[j][k] = v`).
+    pub fn set(&mut self, row: usize, col: usize, value: real64) {
+        self.0.set(row, col, value);
+    }
+
     pub fn new(
         a00: real64, a01: real64, a02: real64,
         a10: real64, a11: real64, a12: real64,

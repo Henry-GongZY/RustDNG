@@ -59,3 +59,49 @@ pub mod dng_parse_utils;
 pub mod dng_shared;
 
 pub use dng_errors::{DngError, DngResult};
+
+// ---------------------------------------------------------------------------
+// Root re-exports: the commonly used foundation types, so downstream crates
+// can write `dng_core::DngString` (the C++ treats these as root names too).
+// ---------------------------------------------------------------------------
+
+pub use dng_date_time::{
+    DngDateTime, DngDateTimeFormat, DngDateTimeInfo, DngDateTimeStorageInfo, DngTimeZone,
+};
+pub use dng_exceptions::{
+    bad_format, eof_failure, memory_full, not_yet_implemented, program_error, read_failure,
+    user_cancel, write_failure,
+};
+pub use dng_fingerprint::{DngFingerprint, DngMd5Printer};
+pub use dng_image::{DngImage, ImageRef};
+pub use dng_matrix::{DngMatrix, DngMatrix3by3, DngMatrix4by3, DngMatrix4by4, DngVector};
+pub use dng_memory::DngMemoryBlock;
+pub use dng_memory_stream::DngMemoryStream;
+pub use dng_parse_utils::*;
+pub use dng_point::{DngPoint, DngPointReal64};
+pub use dng_rational::{DngRational, DngSRational, DngURational};
+pub use dng_rect::{DngRect, DngRectReal64};
+pub use dng_sdk_limits::*;
+pub use dng_shared::{DngCameraProfileDynamicRange, DngCameraProfileInfo, DngShared};
+pub use dng_stream::{
+    DngStream, StreamIO, kBigBufferSize, kDNGStreamInvalidOffset, kDefaultBufferSize,
+    kSmallBufferSize,
+};
+pub use dng_string::{DngString, DngStringTable};
+pub use dng_local_string::{DngLocalString};
+pub use dng_string_list::DngStringList;
+pub use dng_tag_types::*;
+pub use dng_tag_values::*;
+pub use dng_tags::*;
+pub use dng_temperature::DngTemperature;
+pub use dng_xy_coord::{
+    calculate_triple_illuminant_weights, d50_xy_coord, d65_xy_coord, pcs_to_xy, pcs_to_xyz,
+    xy_to_xyz, xyz_to_xy, DngIlluminantData, DngXyCoord,
+};
+pub use dng_matrix::{invert, invert_with_hint, dot as matrix_dot};
+pub use dng_utils::{abs_real64, max_real64, min_real64, pin_real64, pin_real64_01, smooth_step};
+pub use dng_types::*;
+pub use dng_utils::{force_uppercase, pin_int32, pin_uint16, pin_uint32, round_int32_f64, round_uint32_f64, compute_buffer_size, PaddingType};
+pub use dng_safe_arithmetic::convert_double_to_int32;
+
+
