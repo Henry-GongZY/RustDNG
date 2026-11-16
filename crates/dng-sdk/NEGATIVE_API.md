@@ -1,6 +1,6 @@
 # Phase-2 seam contract: dng-sdk crate (Agent A ↔ Agent B)
 
-All code lands in `/Users/shinano/Opensource/RustDNG/crates/dng-sdk/src/` as modules named after the C++ files. Full method-level enumeration is done **from the C++ headers** by the implementing agent — 1:1 porting, no API drops (rules in /Users/shinano/Opensource/RustDNG/ARCHITECTURE.md). This file fixes only the cross-agent types and call directions.
+All code lands in `crates/dng-sdk/src/` as modules named after the C++ files. Full method-level enumeration is done **from the C++ headers** by the implementing agent — 1:1 porting, no API drops (rules in ARCHITECTURE.md). This file fixes only the cross-agent types and call directions.
 
 ## Fixed cross-boundary types
 
