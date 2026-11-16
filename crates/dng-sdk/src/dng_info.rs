@@ -315,9 +315,14 @@ impl DngInfo {
 
                     let sub_ifd_offset = stream.tag_value_uint64(sub_ifds_type)?;
 
-                    let parent_code = tcFirstSubIFD + self.ifd_count() - 2;
+                    // C++ pushes the IFD first and computes
+                    // tcFirstSubIFD + IFDCount() - 2 with the post-push
+                    // count, so the first SubIFD gets exactly
+                    // tcFirstSubIFD.
 
                     self.ifd.push(DngIfd::new());
+
+                    let parent_code = tcFirstSubIFD + self.ifd_count() - 2;
 
                     self.parse_ifd(
                         _host,
@@ -2820,18 +2825,6 @@ mod tests {
 
         info.parse(&mut host, &mut stream).unwrap();
         info.post_parse(&mut host).unwrap();
-
-        // TEMP-DIAG
-        eprintln!("TEMP-DIAGCFA shared.valid={} main={} ifd0.valid={}",
-            info.shared.is_valid_dng(), info.main_index,
-            info.ifd[0].is_valid_dng(&info.shared, 0));
-        eprintln!("TEMP-DIAGCFA planes={} phot={} samples={} bits0={} compression={} uses_strips={} uses_tiles={}",
-            info.shared.camera_profile.color_planes,
-            info.ifd[0].photometric_interpretation,
-            info.ifd[0].samples_per_pixel,
-            info.ifd[0].bits_per_sample[0],
-            info.ifd[0].compression,
-            info.ifd[0].uses_strips, info.ifd[0].uses_tiles);
 
         assert!(info.is_valid_dng());
         assert_eq!(info.main_index, 0);

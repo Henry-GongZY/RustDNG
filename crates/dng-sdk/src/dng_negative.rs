@@ -4213,15 +4213,30 @@ impl DngNegative {
             self.set_noise_reduction_applied(info.ifd[0].noise_reduction_applied);
         }
 
-        // NoiseProfile (prefer the raw IFD over IFD 0).
+        // NoiseProfile (prefer the raw IFD over IFD 0). The C++ parses the
+        // tag inline in dng_ifd ParseTag (no leading count field), so the
+        // parsed (scale, offset) pairs are already available on the IFD.
 
         {
             let mut noise_profile = DngNoiseProfile::new();
 
-            if raw_ifd.noise_profile_count > 0 {
-                noise_profile = parse_noise_profile_tag(stream, raw_ifd.noise_profile_offset)?;
-            } else if info.ifd[0].noise_profile_count > 0 {
-                noise_profile = parse_noise_profile_tag(stream, info.ifd[0].noise_profile_offset)?;
+            let functions: &[((real64, real64))] = if !raw_ifd.noise_functions.is_empty() {
+                &raw_ifd.noise_functions
+            } else {
+                &info.ifd[0].noise_functions
+            };
+
+            if !functions.is_empty() {
+                noise_profile = DngNoiseProfile::with_functions(
+                    functions
+                        .iter()
+                        .map(|(scale, offset)| {
+                            crate::dng_noise_profile::DngNoiseFunction::with_scale_offset(
+                                *scale, *offset,
+                            )
+                        })
+                        .collect(),
+                );
             }
 
             if noise_profile.is_valid() {
@@ -4305,13 +4320,13 @@ impl DngNegative {
             // ProfileGainTableMap (whose usage is Raw IFD).
 
             if info.ifd[0].profile_gain_table_map_count != 0 {
-                stream.set_read_position(info.ifd[0].profile_gain_table_map_offset)?;
+                 stream.set_read_position(info.ifd[0].profile_gain_table_map_offset)?;
 
                 let map = crate::dng_gain_map::DngGainTableMap::get_stream(stream)?;
 
                 self.profile_gain_table_map = Some(std::sync::Arc::new(map));
             } else if raw_ifd.profile_gain_table_map_count != 0 {
-                stream.set_read_position(raw_ifd.profile_gain_table_map_offset)?;
+                 stream.set_read_position(raw_ifd.profile_gain_table_map_offset)?;
 
                 let map = crate::dng_gain_map::DngGainTableMap::get_stream(stream)?;
 
@@ -5002,10 +5017,26 @@ impl DngNegative {
 
         // Read the image.
 
+        let mut lossy_ref = lossy_image;
+
         {
             let ifd = &info.ifd[info.main_index as usize];
 
-            ifd.read_image(host, stream, &stage1_ref)?;
+            // C++ uses dng_read_image::Read here; the DngIfd::read_image
+            // method is a dng-core seam stub (the reader lives in this
+            // crate), so call the real reader directly.
+
+            let mut reader = crate::dng_read_image::DngReadImage::new();
+
+            let image_dyn: &dyn dng_core::DngImage = &*stage1_ref.read().unwrap();
+
+            reader.read(
+                ifd,
+                stream,
+                image_dyn,
+                lossy_ref.as_deref_mut(),
+                None,
+            )?;
         }
 
         // Remember the raw floating point bit depth, if reading from a
@@ -5017,7 +5048,7 @@ impl DngNegative {
 
         // Remember the compressed JPEG data if we read it.
 
-        if let Some(image) = lossy_image {
+        if let Some(image) = lossy_ref {
             self.set_raw_lossy_compressed_image(Some(image));
         }
 

@@ -8,4 +8,5 @@ name = "dng-validate"
 path = "src/main.rs"
 
 [dependencies]
+dng-core = { path = "../dng-core" }
 dng-sdk = { path = "../dng-sdk" }

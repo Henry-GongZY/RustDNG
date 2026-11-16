@@ -693,16 +693,17 @@ impl DngPixelBuffer {
     // ------------------------------------------------------------ copy area
 
     /// `CopyArea (src, area, srcPlane, dstPlane, planes)`.
-    pub fn copy_area(
+    pub fn copy_area_shifted(
         &mut self,
         src: &DngPixelBuffer,
-        area: DngRect,
+        src_area: DngRect,
+        dst_area: DngRect,
         src_plane: uint32,
         dst_plane: uint32,
         planes: uint32,
     ) -> DngResult<()> {
-        let rows = area.h();
-        let cols = area.w();
+        let rows = dst_area.h();
+        let cols = dst_area.w();
 
         let not_yet = || not_yet_implemented();
 
@@ -723,22 +724,22 @@ impl DngPixelBuffer {
             match self.pixel_size {
                 1 => {
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         self.data.set_u8(di, src.data.get_u8(si));
                     });
                 }
                 2 => {
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         self.data.set_u16(di, src.data.get_u16(si));
                     });
                 }
                 4 => {
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         self.data.set_u32(di, src.data.get_u32(si));
                     });
                 }
@@ -748,32 +749,32 @@ impl DngPixelBuffer {
             match self.pixel_type {
                 ttShort => {
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         self.data.set_u16(di, src.data.get_u8(si) as u16);
                     });
                 }
                 ttSShort => {
                     // 8-bit to signed 16: toggle the sign bit (bias by 0x8000).
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         let x = src.data.get_u8(si) as u16;
                         self.data.set_i16(di, (x ^ 0x8000) as i16);
                     });
                 }
                 ttLong => {
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         self.data.set_u32(di, src.data.get_u8(si) as u32);
                     });
                 }
                 ttFloat => {
                     let scale = 1.0f32 / src.pixel_range() as real32;
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         self.data.set_f32(di, scale * src.data.get_u8(si) as real32);
                     });
                 }
@@ -785,8 +786,8 @@ impl DngPixelBuffer {
                     // Truncate to the low byte (little-endian host behavior
                     // of the C++ `+ (qDNGBigEndian ? 1 : 0)` pointer offset).
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         let x = src.data.get_u16(si);
                         self.data.set_u8(di, (x & 0xFF) as uint8);
                     });
@@ -794,24 +795,24 @@ impl DngPixelBuffer {
                 ttSShort => {
                     // 16-bit to signed 16: toggle the sign bit.
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         let x = src.data.get_u16(si);
                         self.data.set_i16(di, (x ^ 0x8000) as i16);
                     });
                 }
                 ttLong => {
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         self.data.set_u32(di, src.data.get_u16(si) as u32);
                     });
                 }
                 ttFloat => {
                     let scale = 1.0f32 / src.pixel_range() as real32;
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         self.data.set_f32(di, scale * src.data.get_u16(si) as real32);
                     });
                 }
@@ -821,8 +822,8 @@ impl DngPixelBuffer {
             match self.pixel_type {
                 ttByte => {
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         let x = src.data.get_i16(si);
                         self.data.set_u8(di, (x as u16 & 0xFF) as uint8);
                     });
@@ -831,8 +832,8 @@ impl DngPixelBuffer {
                     // Moving between signed and unsigned 16-bit just toggles
                     // the sign bit (same "backwards" bottleneck in C++).
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         let x = src.data.get_i16(si);
                         self.data.set_u16(di, (x as u16) ^ 0x8000);
                     });
@@ -840,8 +841,8 @@ impl DngPixelBuffer {
                 ttFloat => {
                     let scale = 1.0f32 / src.pixel_range() as real32;
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         let x = src.data.get_i16(si) as i64 + 32768;
                         self.data.set_f32(di, scale * x as real32);
                     });
@@ -852,16 +853,16 @@ impl DngPixelBuffer {
             match self.pixel_type {
                 ttByte => {
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         let x = src.data.get_u32(si);
                         self.data.set_u8(di, (x & 0xFF) as uint8);
                     });
                 }
                 ttShort => {
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         let x = src.data.get_u32(si);
                         self.data.set_u16(di, (x & 0xFFFF) as u16);
                     });
@@ -873,8 +874,8 @@ impl DngPixelBuffer {
                 ttByte => {
                     let scale = self.pixel_range() as real32;
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         let x = src.data.get_f32(si);
                         self.data.set_u8(di, (pin_overrange(x) * scale + 0.5) as uint8);
                     });
@@ -882,8 +883,8 @@ impl DngPixelBuffer {
                 ttShort => {
                     let scale = self.pixel_range() as real32;
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         let x = src.data.get_f32(si);
                         self.data.set_u16(di, (pin_overrange(x) * scale + 0.5) as u16);
                     });
@@ -891,8 +892,8 @@ impl DngPixelBuffer {
                 ttSShort => {
                     let scale = self.pixel_range() as real32;
                     for_each_pixel!(r, c, p, {
-                        let si = src.pixel_element_index(area.t + r as int32, area.l + c as int32, (src_plane as i64 + p) as uint32)?;
-                        let di = self.pixel_element_index(area.t + r as int32, area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
+                        let si = src.pixel_element_index(src_area.t + r as int32, src_area.l + c as int32, (src_plane as i64 + p) as uint32)?;
+                        let di = self.pixel_element_index(dst_area.t + r as int32, dst_area.l + c as int32, (dst_plane as i64 + p) as uint32)?;
                         let x = src.data.get_f32(si);
                         let xi = (pin_overrange(x) * scale + 0.5) as int32;
                         self.data.set_i16(di, ((xi as u16) ^ 0x8000) as i16);
@@ -905,6 +906,18 @@ impl DngPixelBuffer {
         }
 
         Ok(())
+    }
+
+    /// `CopyArea (src, area, plane, planes)` — same-area variant.
+    pub fn copy_area(
+        &mut self,
+        src: &DngPixelBuffer,
+        area: DngRect,
+        src_plane: uint32,
+        dst_plane: uint32,
+        planes: uint32,
+    ) -> DngResult<()> {
+        self.copy_area_shifted(src, area, area, src_plane, dst_plane, planes)
     }
 
     /// `CopyArea (src, area, plane, planes)`.

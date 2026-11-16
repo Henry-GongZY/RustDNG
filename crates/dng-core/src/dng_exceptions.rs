@@ -122,6 +122,7 @@ pub fn bad_format() -> DngError {
     DngError::BadFormat
 }
 
+
 /// dng_error_matrix_math.
 pub fn matrix_math_error() -> DngError {
     DngError::MatrixMath

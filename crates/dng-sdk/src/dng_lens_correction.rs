@@ -1236,6 +1236,9 @@ impl DngAreaTask for DngFilterWarp {
                     s_pos.v = min_real64(s_pos.v, src_image_area.b - 1.0);
 
                     // Decompose into integer and fractional parts.
+                    // C++ uses ConvertDoubleToInt32 (a truncating cast), so
+                    // the fractional subsample index must truncate, not
+                    // round: 31.97 must stay 31, not become 32.
 
                     let mut s_int = DngPoint::new(
                         round_int32_f64(s_pos.v.floor()),
@@ -1243,8 +1246,8 @@ impl DngAreaTask for DngFilterWarp {
                     );
 
                     let mut s_fct = DngPoint::new(
-                        round_int32_f64((s_pos.v - s_int.v as real64) * num_subsamples),
-                        round_int32_f64((s_pos.h - s_int.h as real64) * num_subsamples),
+                        ((s_pos.v - s_int.v as real64) * num_subsamples) as int32,
+                        ((s_pos.h - s_int.h as real64) * num_subsamples) as int32,
                     );
 
                     // Add resample offset.

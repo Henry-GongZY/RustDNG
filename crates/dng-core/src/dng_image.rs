@@ -692,7 +692,7 @@ pub fn image_get_repeat<I: DngImage + ?Sized>(
                     )?;
                     image.do_get(&mut temp)?;
 
-                    buffer.copy_area(&temp, dst_q, plane, plane, planes)?;
+                    buffer.copy_area_shifted(&temp, src_rect, dst_q, plane, plane, planes)?;
                 }
             }};
         }
