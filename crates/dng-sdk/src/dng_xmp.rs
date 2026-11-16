@@ -13,7 +13,7 @@
 //  * `MakeInitialXMP` seeds the dc/xmp/tiff/exif/crs namespaces the way the
 //    C++ does when a negative has no XMP.
 
-use crate::dng_core::{
+use dng_core::{
     DngError, DngFingerprint, DngLocalString, DngMemoryBlock, DngResult, DngString,
     DngStringList, DngSRational, DngURational,
 };
@@ -1159,78 +1159,110 @@ impl DngXmp {
     }
 
     /// urational field sync used by both the pair wrapper and list elements.
+    /// Exact port of `dng_xmp::Sync_urational` (dng_xmp.cpp:1659).
     pub fn sync_urational_via(&mut self, ns: &str, path: &str, r: &mut DngURational, options: u32) {
-        if options & ignoreXMP != 0 {
-            if r.is_valid() {
-                self.set_urational(ns, path, r);
-            } else {
-                self.remove(ns, path);
-            }
-            return;
-        }
-
-        let mut xmp_value = DngURational::default();
-        let has_xmp = self.get_urational(ns, path, &mut xmp_value);
-
-        if !has_xmp {
-            if r.is_valid() {
-                self.set_urational(ns, path, r);
-            }
-            return;
-        }
-
         let is_default = r.not_valid();
 
-        if is_default {
-            if options & preferXMP != 0 || options & preferNonXMP == 0 {
-                *r = xmp_value;
+        // Sync 1: Force XMP to match non-XMP.
+
+        if options & ignoreXMP != 0 {
+            if is_default && (options & requireXMP != 0) {
+                self.set(ns, path, "");
+            } else if is_default || (options & removeXMP != 0) {
+                self.remove(ns, path);
             } else {
                 self.set_urational(ns, path, r);
             }
-        } else if *r != xmp_value {
-            if options & preferXMP != 0 {
-                *r = xmp_value;
-            } else if options & preferNonXMP != 0 {
+
+            return;
+        }
+
+        // Sync 2: From non-XMP to XMP if non-XMP is prefered.
+
+        if (options & preferNonXMP != 0) && !is_default {
+            if options & removeXMP != 0 {
+                self.remove(ns, path);
+            } else {
                 self.set_urational(ns, path, r);
             }
+
+            return;
+        }
+
+        // Sync 3: From XMP to non-XMP if XMP is prefered or default non-XMP.
+
+        if (options & preferXMP != 0) || is_default {
+            if self.exists(ns, path) {
+                if !self.get_urational(ns, path, r) {
+                    *r = DngURational::default();
+                }
+
+                if options & removeXMP != 0 {
+                    self.remove(ns, path);
+                }
+
+                return;
+            }
+        }
+
+        // Sync 4: From non-XMP to XMP.
+
+        if options & removeXMP != 0 {
+            self.remove(ns, path);
+        } else if !is_default {
+            self.set_urational(ns, path, r);
+        } else if options & requireXMP != 0 {
+            self.set(ns, path, "");
         }
     }
 
-    /// srational field sync.
+    /// srational field sync. Exact port of `dng_xmp::Sync_srational`
+    /// (dng_xmp.cpp:1834).
     pub fn sync_srational_pair(&mut self, ns: &str, path: &str, r: &mut DngSRational, options: u32) {
-        if options & ignoreXMP != 0 {
-            if r.is_valid() {
-                self.set_srational(ns, path, r);
-            } else {
-                self.remove(ns, path);
-            }
-            return;
-        }
-
-        let mut xmp_value = DngSRational::default();
-        let has_xmp = self.get_srational(ns, path, &mut xmp_value);
-
-        if !has_xmp {
-            if r.is_valid() {
-                self.set_srational(ns, path, r);
-            }
-            return;
-        }
-
         let is_default = r.not_valid();
 
-        if is_default {
-            if options & preferXMP != 0 || options & preferNonXMP == 0 {
-                *r = xmp_value;
+        // Sync 1: Force XMP to match non-XMP.
+
+        if options & ignoreXMP != 0 {
+            if is_default || (options & removeXMP != 0) {
+                self.remove(ns, path);
             } else {
                 self.set_srational(ns, path, r);
             }
-        } else if *r != xmp_value {
-            if options & preferXMP != 0 {
-                *r = xmp_value;
-            } else if options & preferNonXMP != 0 {
+
+            return;
+        }
+
+        // Sync 2: From non-XMP to XMP if non-XMP is prefered.
+
+        if (options & preferNonXMP != 0) && !is_default {
+            if options & removeXMP != 0 {
+                self.remove(ns, path);
+            } else {
                 self.set_srational(ns, path, r);
             }
+
+            return;
+        }
+
+        // Sync 3: From XMP to non-XMP if XMP is prefered or default non-XMP.
+
+        if (options & preferXMP != 0) || is_default {
+            if self.get_srational(ns, path, r) {
+                if options & removeXMP != 0 {
+                    self.remove(ns, path);
+                }
+
+                return;
+            }
+        }
+
+        // Sync 4: From non-XMP to XMP.
+
+        if options & removeXMP != 0 {
+            self.remove(ns, path);
+        } else if !is_default {
+            self.set_srational(ns, path, r);
         }
     }
 
@@ -1269,7 +1301,7 @@ impl DngXmp {
 
         // Compute the extended digest.
         let digest = DngFingerprint {
-            data: crate::dng_core::dng_fingerprint::md5_digest(full_bytes),
+            data: dng_core::dng_fingerprint::md5_digest(full_bytes),
         };
 
         // Split: standard packet gets the first part; extended gets the rest
@@ -1344,6 +1376,460 @@ impl DngXmp {
                 self.sdk.set(dest_ns, &dest_path, &value);
             }
         }
+    }
+
+    /// `SyncStringList (ns, path, list, isBag, options)` — exact port
+    /// (dng_xmp.cpp:948).
+    pub fn sync_string_list(
+        &mut self,
+        ns: &str,
+        path: &str,
+        list: &mut DngStringList,
+        is_bag: bool,
+        options: u32,
+    ) {
+        let is_default = list.count() == 0;
+
+        // First make sure the XMP is not badly formatted, since
+        // this breaks some Photoshop logic.
+
+        self.validate_string_list(ns, path);
+
+        // Sync 1: Force XMP to match non-XMP.
+
+        if options & ignoreXMP != 0 {
+            if is_default {
+                self.remove(ns, path);
+            } else {
+                self.set_string_list(ns, path, list, is_bag);
+            }
+
+            return;
+        }
+
+        // Sync 2: From non-XMP to XMP if non-XMP is prefered.
+
+        if (options & preferNonXMP != 0) && !is_default {
+            self.set_string_list(ns, path, list, is_bag);
+
+            return;
+        }
+
+        // Sync 3: From XMP to non-XMP if XMP is prefered or default non-XMP.
+
+        if (options & preferXMP != 0) || is_default {
+            if self.get_string_list(ns, path, list) {
+                return;
+            }
+        }
+
+        // Sync 4: From non-XMP to XMP.
+
+        if !is_default {
+            self.set_string_list(ns, path, list, is_bag);
+        }
+    }
+
+    /// `SyncAltLangDefault (ns, path, s, options)` — exact port
+    /// (dng_xmp.cpp:1125).
+    pub fn sync_alt_lang_default(
+        &mut self,
+        ns: &str,
+        path: &str,
+        s: &mut DngString,
+        options: u32,
+    ) -> bool {
+        let is_default = s.is_empty();
+
+        // Sync 1: Force XMP to match non-XMP.
+
+        if options & ignoreXMP != 0 {
+            if is_default {
+                self.remove(ns, path);
+            } else {
+                self.set_alt_lang_default(ns, path, s);
+            }
+
+            return false;
+        }
+
+        // Sync 2: From non-XMP to XMP if non-XMP is prefered.
+
+        if (options & preferNonXMP != 0) && !is_default {
+            self.set_alt_lang_default(ns, path, s);
+
+            return false;
+        }
+
+        // Sync 3: From XMP to non-XMP if XMP is prefered or default non-XMP.
+
+        if (options & preferXMP != 0) || is_default {
+            if self.get_alt_lang_default(ns, path, s, false) {
+                return true;
+            }
+        }
+
+        // Sync 4: From non-XMP to XMP.
+
+        if !is_default {
+            self.set_alt_lang_default(ns, path, s);
+        }
+
+        false
+    }
+
+    /// `ValidateStringList (ns, path)` — remove the property when it is
+    /// present but not a proper array (dng_xmp.cpp:4508 /
+    /// dng_xmp_sdk.cpp:1060).
+    pub fn validate_string_list(&mut self, ns: &str, path: &str) {
+        // The dng-xmp facade rejects non-array property shapes lazily; the
+        // C++ validates by attempting array-item access.  The port removes
+        // the property when it exists but is not an array (see
+        // dng_xmp_sdk::validate_string_list).
+        self.sdk.validate_string_list(ns, path);
+    }
+
+    /// `ValidateMetadata ()` — fix up values that should be arrays
+    /// (dng_xmp.cpp:4518).
+    pub fn validate_metadata(&mut self) {
+        // The following values should be arrays, but are not always.  So
+        // fix them up because Photoshop sometimes has problems parsing
+        // invalid tags.
+
+        self.validate_string_list(XMP_NS_DC, "creator");
+
+        self.validate_string_list(XMP_NS_PHOTOSHOP, "Keywords");
+        self.validate_string_list(XMP_NS_PHOTOSHOP, "SupplementalCategories");
+    }
+
+    /// `SyncExifDate (ns, path, exifDateTime, canRemoveFromXMP,
+    /// removeFromXMP, fakeTimeZone)` — exact port (dng_xmp.cpp:4534).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_exif_date(
+        &mut self,
+        ns: &str,
+        path: &str,
+        exif_date_time: &mut dng_core::DngDateTimeInfo,
+        can_remove_from_xmp: bool,
+        remove_from_xmp: bool,
+        fake_time_zone: &dng_core::DngTimeZone,
+    ) {
+        let mut s = DngString::new();
+
+        // Find information on XMP side.
+
+        let mut xmp_date_time = dng_core::DngDateTimeInfo::new();
+
+        if self.get_string(ns, path, &mut s) {
+            if s.is_empty() {
+                // XMP contains a NULL string.  Clear EXIF date,
+                // and remove XMP tag if possible.
+
+                exif_date_time.clear();
+
+                if can_remove_from_xmp && remove_from_xmp {
+                    self.remove(ns, path);
+                }
+
+                return;
+            }
+
+            xmp_date_time.decode_iso_8601(s.get());
+
+            // If the time zone matches the fake time zone,
+            // ignore it on the XMP side.
+
+            if fake_time_zone.is_valid()
+                && xmp_date_time.time_zone().is_valid()
+                && xmp_date_time.time_zone().offset_minutes() == fake_time_zone.offset_minutes()
+            {
+                xmp_date_time.clear_zone();
+            }
+        }
+
+        // If both are valid, we need to resolve.
+
+        if exif_date_time.is_valid() && xmp_date_time.is_valid() {
+            // Kludge: The Nikon D4 is writing date only date/times into
+            // XMP, so prefer the EXIF values if the XMP only contains a
+            // date.
+
+            if xmp_date_time.is_date_only() {
+                xmp_date_time = exif_date_time.clone();
+            }
+            // Kludge: Nikon sometimes writes XMP values without a time zone
+            // but the EXIF contains a valid time zone.  So in that case,
+            // prefer the EXIF.
+            else if exif_date_time.date_time() == xmp_date_time.date_time()
+                && exif_date_time.time_zone().is_valid()
+                && !xmp_date_time.time_zone().is_valid()
+            {
+                xmp_date_time = exif_date_time.clone();
+            }
+            // Else assume that XMP is correct.
+            else {
+                *exif_date_time = xmp_date_time.clone();
+            }
+        }
+        // Else just pick the valid one.
+        else if xmp_date_time.is_valid() {
+            *exif_date_time = xmp_date_time.clone();
+        } else if exif_date_time.is_valid() {
+            xmp_date_time = exif_date_time.clone();
+        }
+        // Else nothing is valid.
+        else {
+            // Remove XMP side, if any.
+
+            self.remove(ns, path);
+
+            return;
+        }
+
+        // Should we just remove the XMP version?
+
+        if can_remove_from_xmp && remove_from_xmp {
+            self.remove(ns, path);
+        } else {
+            s = exif_date_time.encode_iso_8601();
+
+            self.set_string(ns, path, &s);
+        }
+    }
+
+    /// `UpdateExifDates (exif, removeFromXMP)` — exact port
+    /// (dng_xmp.cpp:4675).
+    pub fn update_exif_dates(&mut self, exif: &mut DngExif, remove_from_xmp: bool) {
+        // The fake-time-zone detection block is disabled in the C++ source
+        // (#if 0); fakeTimeZone stays invalid.
+
+        let fake_time_zone = dng_core::DngTimeZone::new();
+
+        // For the following three date/time fields, we generally prefer XMP
+        // to the EXIF values.  This is to allow the user to correct the
+        // date/times via changes in a sidecar XMP file, without modifying
+        // the original raw file.
+
+        // Modification Date/Time:
+        // exif.fDateTime
+        // kXMP_NS_XMP:"ModifyDate" & kXMP_NS_TIFF:"DateTime" are aliased
+
+        self.sync_exif_date(
+            XMP_NS_TIFF,
+            "DateTime",
+            &mut exif.date_time,
+            false, // Cannot remove because aliased
+            remove_from_xmp,
+            &fake_time_zone,
+        );
+
+        // Original Date/Time:
+        // exif.fDateTimeOriginal
+        // IPTC: DateCreated
+        // XMP_NS_EXIF:"DateTimeOriginal" & XMP_NS_PHOTOSHOP:"DateCreated"
+        // Adobe has decided to keep the two XMP fields separate.
+
+        {
+            self.sync_exif_date(
+                XMP_NS_EXIF,
+                "DateTimeOriginal",
+                &mut exif.date_time_original,
+                true,
+                remove_from_xmp,
+                &fake_time_zone,
+            );
+
+            // Sync the IPTC value to the EXIF value if only the EXIF
+            // value exists.
+
+            if exif.date_time_original.is_valid() {
+                // See if the fake time zone was cloned into DateCreated
+                // field.
+
+                let mut force_update = false;
+
+                if fake_time_zone.is_valid() {
+                    let mut s = DngString::new();
+
+                    if self.get_string(XMP_NS_PHOTOSHOP, "DateCreated", &mut s) && s.not_empty() {
+                        let mut info = dng_core::DngDateTimeInfo::new();
+
+                        info.decode_iso_8601(s.get());
+
+                        if info.date_time() == exif.date_time_original.date_time() {
+                            force_update = true;
+                        }
+                    }
+                }
+
+                if !self.exists(XMP_NS_PHOTOSHOP, "DateCreated") || force_update {
+                    let s = exif.date_time_original.encode_iso_8601();
+
+                    self.set_string(XMP_NS_PHOTOSHOP, "DateCreated", &s);
+                }
+            }
+        }
+
+        // Date Time Digitized:
+        // XMP_NS_EXIF:"DateTimeDigitized" & kXMP_NS_XMP:"CreateDate" are
+        // aliased
+
+        self.sync_exif_date(
+            XMP_NS_EXIF,
+            "DateTimeDigitized",
+            &mut exif.date_time_digitized,
+            false, // Cannot remove because aliased
+            remove_from_xmp,
+            &fake_time_zone,
+        );
+    }
+
+    /// `UpdateDateTime (dt)` (dng_xmp.cpp:4819).
+    pub fn update_date_time(&mut self, dt: &dng_core::DngDateTimeInfo) {
+        let s = dt.encode_iso_8601();
+
+        self.set_string(XMP_NS_TIFF, "DateTime", &s);
+    }
+
+    /// `UpdateMetadataDate (dt)` (dng_xmp.cpp:4832).
+    pub fn update_metadata_date(&mut self, dt: &dng_core::DngDateTimeInfo) {
+        let s = dt.encode_iso_8601();
+
+        self.set_string(XMP_NS_XMP, "MetadataDate", &s);
+    }
+
+    /// `HasOrientation ()` (dng_xmp.cpp:4845).
+    pub fn has_orientation(&self) -> bool {
+        let mut x = 0u32;
+
+        if self.get_uint32(XMP_NS_TIFF, "Orientation", &mut x) {
+            return (1..=8).contains(&x);
+        }
+
+        false
+    }
+
+    /// `GetOrientation ()` (dng_xmp.cpp:4865).
+    pub fn get_orientation(&self) -> dng_core::DngOrientation {
+        let mut result = dng_core::DngOrientation::new();
+
+        let mut x = 0u32;
+
+        if self.get_uint32(XMP_NS_TIFF, "Orientation", &mut x) {
+            if (1..=8).contains(&x) {
+                result.set_tiff(x);
+            }
+        }
+
+        result
+    }
+
+    /// `ClearOrientation ()` (dng_xmp.cpp:4892).
+    pub fn clear_orientation(&mut self) {
+        self.remove(XMP_NS_TIFF, "Orientation");
+    }
+
+    /// `SetOrientation (orientation)` (dng_xmp.cpp:4901).
+    pub fn set_orientation(&mut self, orientation: &dng_core::DngOrientation) {
+        self.set_uint32(XMP_NS_TIFF, "Orientation", orientation.get_tiff());
+    }
+
+    /// `SyncOrientation (negative, xmpIsMaster)` (dng_xmp.cpp:4912).
+    pub fn sync_orientation(
+        &mut self,
+        negative: &mut crate::dng_negative::DngNegative,
+        xmp_is_master: bool,
+    ) {
+        let metadata = &mut negative.metadata;
+
+        self.sync_orientation_metadata(metadata, xmp_is_master);
+    }
+
+    /// `SyncOrientation (metadata, xmpIsMaster)` (dng_xmp.cpp:4922).
+    pub fn sync_orientation_metadata(
+        &mut self,
+        metadata: &mut crate::dng_negative::DngMetadata,
+        xmp_is_master: bool,
+    ) {
+        // See if XMP contains the orientation.
+
+        let xmp_has_orientation = self.has_orientation();
+
+        // See if XMP is the master value.
+
+        if xmp_has_orientation && (xmp_is_master || !metadata.has_base_orientation()) {
+            metadata.set_base_orientation(self.get_orientation());
+        } else {
+            self.set_orientation(&metadata.base_orientation);
+        }
+    }
+
+    /// `ClearImageInfo ()` (dng_xmp.cpp:4950).
+    pub fn clear_image_info(&mut self) {
+        self.remove(XMP_NS_TIFF, "ImageWidth");
+        self.remove(XMP_NS_TIFF, "ImageLength");
+
+        self.remove(XMP_NS_EXIF, "PixelXDimension");
+        self.remove(XMP_NS_EXIF, "PixelYDimension");
+
+        self.remove(XMP_NS_TIFF, "BitsPerSample");
+
+        self.remove(XMP_NS_TIFF, "Compression");
+
+        self.remove(XMP_NS_TIFF, "PhotometricInterpretation");
+
+        // "Orientation" is handled separately.
+
+        self.remove(XMP_NS_TIFF, "SamplesPerPixel");
+
+        self.remove(XMP_NS_TIFF, "PlanarConfiguration");
+
+        self.remove(XMP_NS_TIFF, "XResolution");
+        self.remove(XMP_NS_TIFF, "YResolution");
+
+        self.remove(XMP_NS_TIFF, "ResolutionUnit");
+
+        self.remove(XMP_NS_PHOTOSHOP, "ColorMode");
+        self.remove(XMP_NS_PHOTOSHOP, "ICCProfile");
+    }
+
+    /// `SetImageSize (size)` (dng_xmp.cpp:4983).
+    pub fn set_image_size(&mut self, size: &dng_core::DngPoint) {
+        self.set_uint32(XMP_NS_TIFF, "ImageWidth", size.h as u32);
+        self.set_uint32(XMP_NS_TIFF, "ImageLength", size.v as u32);
+
+        // Mirror these values to the EXIF tags.
+
+        self.set_uint32(XMP_NS_EXIF, "PixelXDimension", size.h as u32);
+        self.set_uint32(XMP_NS_EXIF, "PixelYDimension", size.v as u32);
+    }
+
+    /// `SetSampleInfo (samplesPerPixel, bitsPerSample)` (dng_xmp.cpp:4998).
+    pub fn set_sample_info(&mut self, samples_per_pixel: u32, bits_per_sample: u32) {
+        self.set_uint32(XMP_NS_TIFF, "SamplesPerPixel", samples_per_pixel);
+
+        let ss = DngString::from_bytes(format!("{}", bits_per_sample).as_bytes());
+
+        let mut list = DngStringList::new();
+
+        for _ in 0..samples_per_pixel {
+            list.append(&ss);
+        }
+
+        self.set_string_list(XMP_NS_TIFF, "BitsPerSample", &list, false);
+    }
+
+    /// `SetPhotometricInterpretation (pi)` (dng_xmp.cpp:5025).
+    pub fn set_photometric_interpretation(&mut self, pi: u32) {
+        self.set_uint32(XMP_NS_TIFF, "PhotometricInterpretation", pi);
+    }
+
+    /// `SetResolution (res)` (dng_xmp.cpp:5034).
+    pub fn set_resolution(&mut self, res: &crate::dng_negative::DngResolution) {
+        self.set_urational(XMP_NS_TIFF, "XResolution", &res.x_resolution);
+        self.set_urational(XMP_NS_TIFF, "YResolution", &res.y_resolution);
+
+        self.set_uint32(XMP_NS_TIFF, "ResolutionUnit", res.resolution_unit as u32);
     }
 
     /// `MakeInitialXMP` (dng_negative.cpp helper surfaced here) — seeds the
@@ -1455,7 +1941,7 @@ mod tests {
     fn fingerprint_roundtrip() {
         let mut xmp = DngXmp::new();
         let digest = DngFingerprint {
-            data: crate::dng_core::dng_fingerprint::md5_digest(b"test data"),
+            data: dng_core::dng_fingerprint::md5_digest(b"test data"),
         };
 
         xmp.set_fingerprint(XMP_NS_PHOTOSHOP, "IptcDigest", &digest, false);
@@ -1509,7 +1995,7 @@ mod tests {
 
         let block = iptc.spool(false).unwrap();
         let digest = DngFingerprint {
-            data: crate::dng_core::dng_fingerprint::md5_digest(block.buffer()),
+            data: dng_core::dng_fingerprint::md5_digest(block.buffer()),
         };
 
         // No digest in XMP -> MWG prefers XMP (i.e., IPTC fields do NOT

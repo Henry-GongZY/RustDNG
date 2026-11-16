@@ -13,15 +13,16 @@
 // DngCameraProfileInfo parser for the tag set and add the extended-block
 // fields (hue-sat deltas, look table, tone curve) here.
 
-use crate::dng_core::dng_exceptions::program_error;
-use crate::dng_core::dng_fingerprint::{DngFingerprint, DngMd5PrinterStream};
-use crate::dng_core::{
-    bad_format, defaultBlackRender_Auto, encoding_Linear, lsUnknown, DngError, DngResult,
-    DngSRational, DngShared, DngStream, DngString, DngURational, kMaxColorPlanes,
-    pepAllowCopying, profileToneMethod_Unspecified, ttRational, ttSRational, ttShort,
+use dng_core::dng_exceptions::program_error;
+use dng_core::dng_fingerprint::{DngFingerprint, DngMd5PrinterStream};
+use dng_core::{
+    bad_format, calculate_triple_illuminant_weights, defaultBlackRender_Auto, encoding_Linear,
+    int32, lsUnknown, DngError, DngResult, DngSRational, DngShared, DngStream, DngString,
+    DngTemperature, DngURational, DngXyCoord, kMaxColorPlanes, pepAllowCopying, pepEmbedIfUsed,
+    pepNoRestrictions, profileToneMethod_Unspecified, ttRational, ttSRational, ttShort, uint32,
 };
-use crate::dng_core::dng_xy_coord::{pcs_to_xyz, DngIlluminantData};
-use crate::dng_core::{DngMatrix, DngVector};
+use dng_core::dng_xy_coord::{pcs_to_xyz, DngIlluminantData};
+use dng_core::{DngMatrix, DngVector};
 use crate::dng_hue_sat_map::{DngHueSatMap, HSBModify};
 use crate::dng_gain_map::DngGainTableMap;
 use crate::dng_tone_curve::DngToneCurve;
@@ -76,7 +77,7 @@ impl DngCameraProfileId {
     }
 
     /// `AddDigest (printer)` — MD5 of the name and fingerprint.
-    pub fn add_digest(&self, printer: &mut DngMd5PrinterStream) -> crate::dng_core::DngResult<()> {
+    pub fn add_digest(&self, printer: &mut DngMd5PrinterStream) -> dng_core::DngResult<()> {
         printer.stream().put(self.name.get())?;
         if self.fingerprint.is_valid() {
             printer.stream().put(&self.fingerprint.data)?;
@@ -105,7 +106,7 @@ pub struct DngCameraProfile {
     name: DngString,
     group_name: DngString,
     // Dynamic range info (DNG 1.7): kept as the phase-1 struct.
-    pub dynamic_range_info: Option<crate::dng_core::DngCameraProfileDynamicRange>,
+    pub dynamic_range_info: Option<dng_core::DngCameraProfileDynamicRange>,
 
     calibration_illuminant1: u32,
     calibration_illuminant2: u32,
@@ -287,7 +288,7 @@ impl DngCameraProfile {
     /// `IlluminantToTemperature (light, data)` — temperature of a standard
     /// illuminant, or the spectrum-derived white point's temperature.
     pub fn illuminant_to_temperature(light: u32, data: &DngIlluminantData) -> real64 {
-        use crate::dng_core::dng_tag_values::*;
+        use dng_core::dng_tag_values::*;
 
         if !data.is_valid() {
             return 0.0;
@@ -311,7 +312,7 @@ impl DngCameraProfile {
             _ => {
                 // Non-standard illuminant: use the derived white point.
                 if data.white_xy().is_valid() {
-                    let temp = crate::dng_core::DngTemperature::from_xy(*data.white_xy());
+                    let temp = dng_core::DngTemperature::from_xy(*data.white_xy());
                     temp.temperature()
                 } else {
                     0.0
@@ -763,7 +764,7 @@ impl DngCameraProfile {
 
     /// `FingerprintMatrix` — writes the matrix as a tag_matrix payload
     /// (rows/cols header + doubles), little-endian.
-    fn fingerprint_matrix(printer: &mut crate::dng_core::DngStream, matrix: &DngMatrix) {
+    fn fingerprint_matrix(printer: &mut dng_core::DngStream, matrix: &DngMatrix) {
         // tag_matrix (0, matrix): type ttSRational in C++ tag encode? No —
         // tag_matrix uses ttSRational encoding of the double values rounded
         // through dng_srational.  Mirror: rows, cols as uint32 header, then
@@ -783,7 +784,7 @@ impl DngCameraProfile {
     }
 
     /// `FingerprintHueSatMap`.
-    fn fingerprint_hue_sat_map(printer: &mut crate::dng_core::DngStream, map: &DngHueSatMap) {
+    fn fingerprint_hue_sat_map(printer: &mut dng_core::DngStream, map: &DngHueSatMap) {
         if map.is_null() {
             return;
         }
@@ -1001,8 +1002,149 @@ impl DngCameraProfile {
     /// `Parse (stream, shared)` — reads a profile from the tag stream (the
     /// CameraProfile tag format, reusing the phase-1 wire parser from
     /// dng-core) and then the extended block if present.
+    /// `ProfileID ()` — name + fingerprint id.
+    pub fn profile_id(&self) -> DngCameraProfileId {
+        let fingerprint = self.fingerprint();
+
+        DngCameraProfileId::from_name_fingerprint(
+            std::str::from_utf8(self.name().get()).unwrap_or(""),
+            &fingerprint,
+        )
+    }
+
+    /// `IsLegalToEmbed ()` — per the profile's embed policy.
+    pub fn is_legal_to_embed(&self) -> bool {
+        self.was_read_from_dng()
+            || self.embed_policy() == pepAllowCopying
+            || self.embed_policy() == pepEmbedIfUsed
+            || self.embed_policy() == pepNoRestrictions
+    }
+
+    /// `UniqueID ()` — MD5 over the fingerprint plus the unique camera model
+    /// restriction string (dng_camera_profile.cpp:835).
+    pub fn unique_id(&self) -> DngFingerprint {
+        let mut printer = dng_core::dng_fingerprint::DngMd5Printer::new();
+
+        printer.process(&self.fingerprint().data);
+        printer.process(self.unique_camera_model_restriction().get());
+
+        *printer.result()
+    }
+
+    /// `EqualData (profile)` — render-data fingerprint equality.
+    pub fn equal_data(&self, profile: &DngCameraProfile) -> bool {
+        self.render_data_fingerprint() == profile.render_data_fingerprint()
+    }
+
+    /// `HueSatMapForWhite (white)` — finds the hue/sat table to use for a
+    /// given white point, if any (dng_camera_profile.cpp:1865).
+    pub fn hue_sat_map_for_white(&self, white: &DngXyCoord) -> DngResult<Option<DngHueSatMap>> {
+        if self.hue_sat_deltas1().is_valid() {
+            // If we only have the first table, just use it for any color
+            // temperature.
+
+            if !self.hue_sat_deltas2().is_valid() {
+                return Ok(Some(self.hue_sat_deltas1().clone()));
+            }
+
+            // We have table 1 and table 2.
+
+            if self.illuminant_model() == 3 {
+                // This means we also have a 3rd hue sat map, since all three
+                // are required to be present or absent for a
+                // triple-illuminant profile.
+
+                return self.hue_sat_map_for_white_triple(white).map(Some);
+            } else {
+                // Dual-illuminant model.
+
+                return self.hue_sat_map_for_white_dual(white).map(Some);
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// `HueSatMapForWhite_Dual (white)` (dng_camera_profile.cpp:1908).
+    fn hue_sat_map_for_white_dual(&self, white: &DngXyCoord) -> DngResult<DngHueSatMap> {
+        debug_assert!(
+            self.hue_sat_deltas1().is_valid() && self.hue_sat_deltas2().is_valid(),
+            "Bad hue sat map deltas 1 or 2"
+        );
+
+        // Interpolate based on color temperature.
+
+        let mut temperature1 = self.calibration_temperature1();
+        let mut temperature2 = self.calibration_temperature2();
+
+        if temperature1 <= 0.0 || temperature2 <= 0.0 || temperature1 == temperature2 {
+            return Ok(self.hue_sat_deltas1().clone());
+        }
+
+        let reverse_order = temperature1 > temperature2;
+
+        if reverse_order {
+            std::mem::swap(&mut temperature1, &mut temperature2);
+        }
+
+        // Convert to temperature/offset space.
+
+        let td = DngTemperature::from_xy(*white);
+
+        // Find fraction to weight the first calibration.
+
+        let mut g;
+
+        if td.temperature() <= temperature1 {
+            g = 1.0;
+        } else if td.temperature() >= temperature2 {
+            g = 0.0;
+        } else {
+            let inv_t = 1.0 / td.temperature();
+
+            g = (inv_t - (1.0 / temperature2)) / ((1.0 / temperature1) - (1.0 / temperature2));
+        }
+
+        // Fix up if we swapped the order.
+
+        if reverse_order {
+            g = 1.0 - g;
+        }
+
+        // Do the interpolation.
+
+        DngHueSatMap::interpolate(self.hue_sat_deltas1(), self.hue_sat_deltas2(), g)
+    }
+
+    /// `HueSatMapForWhite_Triple (white)` (dng_camera_profile.cpp:1947).
+    fn hue_sat_map_for_white_triple(&self, white: &DngXyCoord) -> DngResult<DngHueSatMap> {
+        debug_assert!(
+            self.hue_sat_deltas1().is_valid()
+                && self.hue_sat_deltas2().is_valid()
+                && self.hue_sat_deltas3().is_valid(),
+            "Bad hue sat map deltas 1 or 2 or 3"
+        );
+
+        let light1 =
+            DngIlluminantData::from_light(self.calibration_illuminant1(), Some(self.illuminant_data1()))?;
+        let light2 =
+            DngIlluminantData::from_light(self.calibration_illuminant2(), Some(self.illuminant_data2()))?;
+        let light3 =
+            DngIlluminantData::from_light(self.calibration_illuminant3(), Some(self.illuminant_data3()))?;
+
+        let (w1, w2, _w3) = calculate_triple_illuminant_weights(white, &light1, &light2, &light3);
+
+        DngHueSatMap::interpolate3(
+            self.hue_sat_deltas1(),
+            self.hue_sat_deltas2(),
+            self.hue_sat_deltas3(),
+            w1,
+            w2,
+        )
+    }
+
     pub fn parse(&mut self, stream: &mut DngStream, shared: &DngShared) -> DngResult<bool> {
-        let mut info = crate::dng_core::DngCameraProfileInfo::new();
+        let mut info = dng_core::DngCameraProfileInfo::new();
 
         let mut got_any = false;
 
@@ -1030,7 +1172,7 @@ impl DngCameraProfile {
     }
 
     /// Applies a parsed wire-format info block to the live profile fields.
-    pub fn apply_info(&mut self, info: &crate::dng_core::DngCameraProfileInfo, _shared: &DngShared) {
+    pub fn apply_info(&mut self, info: &dng_core::DngCameraProfileInfo, _shared: &DngShared) {
         self.set_name(&String::from_utf8_lossy(info.profile_name.get()));
         self.profile_calibration_signature = info.profile_calibration_signature.clone();
         self.copyright = info.profile_copyright.clone();
@@ -1086,6 +1228,180 @@ impl DngCameraProfile {
 }
 
 type real64 = f64;
+
+// ---------------------------------------------------------------------------
+// Free helpers and metadata types (dng_camera_profile.cpp tail).
+// ---------------------------------------------------------------------------
+
+/// `SplitCameraProfileName (name, baseName, version)` — splits version
+/// suffixes like " beta", " beta N" and " vN" off a profile name
+/// (dng_camera_profile.cpp:2270).
+pub fn split_camera_profile_name(name: &DngString) -> (DngString, int32) {
+    let bytes: &[u8] = name.get();
+
+    let mut base_name = name.clone();
+
+    let mut version: int32 = 0;
+
+    let len = bytes.len();
+
+    // Special case ACR M.N version suffixes.
+
+    if len == 7 && name.starts_with(b"ACR ", true) {
+        let c0 = bytes[len - 3];
+        let dot = bytes[len - 2];
+        let c1 = bytes[len - 1];
+
+        if c0.is_ascii_digit() && dot == b'.' && c1.is_ascii_digit() {
+            base_name.truncate(3);
+
+            version = ((c0 - b'0') as int32) * 10 + ((c1 - b'0') as int32);
+        }
+
+        return (base_name, version);
+    }
+
+    // " beta" suffix.
+
+    if len > 5 && name.ends_with(b" beta", false) {
+        base_name.truncate((len - 5) as uint32);
+
+        version += -10;
+    } else if len > 7 {
+        let last_char = bytes[len - 1];
+
+        if last_char.is_ascii_digit() {
+            let mut temp = name.clone();
+            temp.truncate((len - 1) as uint32);
+
+            if temp.ends_with(b" beta ", false) {
+                base_name.truncate((len - 7) as uint32);
+
+                version += ((last_char - b'0') as int32) - 10;
+            }
+        }
+    }
+
+    // " vN" suffix.
+
+    let len = base_name.length() as usize;
+
+    if len > 3 {
+        let bytes: &[u8] = base_name.get();
+
+        let last_char = bytes[len - 1];
+
+        if last_char.is_ascii_digit() {
+            let mut temp = base_name.clone();
+            temp.truncate((len - 1) as uint32);
+
+            if temp.ends_with(b" v", false) {
+                base_name.truncate((len - 3) as uint32);
+
+                version += ((last_char - b'0') as int32) * 100;
+            }
+        }
+    }
+
+    (base_name, version)
+}
+
+/// Port of `dng_camera_profile_metadata`.
+#[derive(Debug, Clone, Default)]
+pub struct DngCameraProfileMetadata {
+    /// `fProfileID`.
+    pub profile_id: DngCameraProfileId,
+
+    /// `fGroupName`.
+    pub group_name: DngString,
+
+    /// `fHDR`.
+    pub hdr: bool,
+
+    /// `fRenderDataFingerprint`.
+    pub render_data_fingerprint: DngFingerprint,
+
+    /// `fIsLegalToEmbed`.
+    pub is_legal_to_embed: bool,
+
+    /// `fWasReadFromDNG`.
+    pub was_read_from_dng: bool,
+
+    /// `fWasReadFromDisk`.
+    pub was_read_from_disk: bool,
+
+    /// `fUniqueID` — only valid if `was_read_from_disk` is true.
+    pub unique_id: DngFingerprint,
+
+    /// `fFilePath` — only valid if `was_read_from_disk` is true.
+    pub file_path: DngString,
+
+    /// `fReadOnly` — only valid if `was_read_from_disk` is true.
+    pub read_only: bool,
+
+    /// `fIndex` — only valid if attached to negative.
+    pub index: int32,
+}
+
+impl DngCameraProfileMetadata {
+    /// `dng_camera_profile_metadata (profile, index)`.
+    pub fn from_profile(profile: &DngCameraProfile, index: int32) -> Self {
+        let was_read_from_disk = profile.was_read_from_disk();
+
+        let unique_id = if was_read_from_disk {
+            profile.unique_id()
+        } else {
+            DngFingerprint::new()
+        };
+
+        DngCameraProfileMetadata {
+            profile_id: profile.profile_id(),
+            group_name: profile.group_name().clone(),
+            hdr: profile.is_hdr(),
+            render_data_fingerprint: profile.render_data_fingerprint(),
+            is_legal_to_embed: profile.is_legal_to_embed(),
+            was_read_from_dng: profile.was_read_from_dng(),
+            was_read_from_disk,
+            unique_id,
+            file_path: DngString::new(),
+            read_only: true,
+            index,
+        }
+    }
+}
+
+impl PartialEq for DngCameraProfileMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.profile_id == other.profile_id
+            && self.group_name == other.group_name
+            && self.hdr == other.hdr
+            && self.render_data_fingerprint == other.render_data_fingerprint
+            && self.is_legal_to_embed == other.is_legal_to_embed
+            && self.was_read_from_dng == other.was_read_from_dng
+            && self.was_read_from_disk == other.was_read_from_disk
+            && self.unique_id == other.unique_id
+            && self.file_path == other.file_path
+            && self.read_only == other.read_only
+            && self.index == other.index
+    }
+}
+
+impl Eq for DngCameraProfileMetadata {}
+
+/// Port of `dng_camera_profile_group_selector` (dng_camera_profile.h:195).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DngCameraProfileGroupSelector {
+    /// `fHDR` — selection: false = SDR, true = HDR.
+    pub hdr: bool,
+}
+
+/// `dng_profile_metadata_list`.
+pub type DngProfileMetadataList = Vec<DngCameraProfileMetadata>;
+
+/// Render-data fingerprint comparison (`EqualData`).
+pub fn camera_profile_equal_data(a: &DngCameraProfile, b: &DngCameraProfile) -> bool {
+    a.render_data_fingerprint() == b.render_data_fingerprint()
+}
 
 #[cfg(test)]
 mod tests {

@@ -2,7 +2,7 @@
 // IIM binary spooling (always UTF-8 with the encoding marker, per the
 // metadata working group change the C++ describes).
 
-use crate::dng_core::{
+use dng_core::{
     DngDateTimeInfo, DngMemoryBlock, DngMemoryStream, DngStream, DngString, DngStringList,
 };
 
@@ -144,7 +144,7 @@ impl DngIptc {
     }
 
     /// `ParseString (stream, s, charSet)`.
-    fn parse_string(stream: &mut DngStream, s: &mut DngString, char_set: u32) -> crate::dng_core::DngResult<()> {
+    fn parse_string(stream: &mut DngStream, s: &mut DngString, char_set: u32) -> dng_core::DngResult<()> {
         let length = stream.get_uint16()?;
 
         let mut c = stream.get(length as uint32)?;
@@ -385,7 +385,7 @@ impl DngIptc {
         data_set: u8,
         max_chars: uint32,
         char_set: u32,
-    ) -> crate::dng_core::DngResult<()> {
+    ) -> dng_core::DngResult<()> {
         if s.is_empty() {
             return Ok(());
         }
@@ -443,7 +443,7 @@ impl DngIptc {
     }
 
     /// `Spool (allocator, padForTIFF)` — returns the IIM block bytes.
-    pub fn spool(&self, pad_for_tiff: bool) -> crate::dng_core::DngResult<DngMemoryBlock> {
+    pub fn spool(&self, pad_for_tiff: bool) -> dng_core::DngResult<DngMemoryBlock> {
         let mut stream = DngMemoryStream::with_page_size(2048).stream();
 
         stream.set_big_endian(true);

@@ -3,12 +3,12 @@
 // The C++ list owns raw `dng_opcode *` pointers; the port stores
 // `Box<dyn DngOpcode>` entries.
 
-use crate::dng_core::{
+use dng_core::{
     bad_format, dngVersion_None, max_uint32, DngHost, DngResult, DngStream, DngURational, uint32,
 };
-use crate::dng_core::dng_memory::DngMemoryBlock;
-use crate::dng_core::dng_memory_stream::DngMemoryStream;
-use crate::dng_core::dng_stream::TempBigEndian;
+use dng_core::dng_memory::DngMemoryBlock;
+use dng_core::dng_memory_stream::DngMemoryStream;
+use dng_core::dng_stream::TempBigEndian;
 use crate::dng_negative::DngNegative;
 use crate::dng_opcodes::{DngOpcode, dngOpcode_Private};
 
@@ -118,7 +118,7 @@ impl DngOpcodeList {
         &mut self,
         host: &mut DngHost,
         negative: &mut DngNegative,
-        image: &mut crate::dng_core::ImageRef,
+        image: &mut dng_core::ImageRef,
     ) -> DngResult<()> {
         let mut prev_opcode_was_optional_warp_rectilinear2 = false;
 
@@ -170,7 +170,7 @@ impl DngOpcodeList {
         }
 
         if self.always_apply() {
-            return Err(crate::dng_core::program_error());
+            return Err(dng_core::program_error());
         }
 
         let mut stream = DngMemoryStream::with_page_size(2048).stream();
@@ -223,22 +223,26 @@ impl DngOpcodeList {
     ) -> DngResult<()> {
         self.clear();
 
-        let _temp_big_endian = TempBigEndian::new(stream, true);
+        {
+            let mut temp_big_endian = TempBigEndian::new(stream, true);
 
-        stream.set_read_position(stream_offset)?;
+            let stream = temp_big_endian.stream();
 
-        let count = stream.get_uint32()?;
+            stream.set_read_position(stream_offset)?;
 
-        for _index in 0..count {
-            let opcode_id = stream.get_uint32()?;
+            let count = stream.get_uint32()?;
 
-            let opcode = crate::dng_opcodes::make_dng_opcode(opcode_id, stream)?;
+            for _index in 0..count {
+                let opcode_id = stream.get_uint32()?;
 
-            self.append(opcode);
-        }
+                let opcode = crate::dng_opcodes::make_dng_opcode(opcode_id, stream)?;
 
-        if stream.position() != stream_offset + byte_count as u64 {
-            return Err(bad_format()); // "Error parsing opcode list"
+                self.append(opcode);
+            }
+
+            if stream.position() != stream_offset + byte_count as u64 {
+                return Err(bad_format()); // "Error parsing opcode list"
+            }
         }
 
         Ok(())
@@ -268,7 +272,9 @@ impl DngOpcodeList {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dng_core::DngMemoryStream;
+    use crate::dng_misc_opcodes::DngOpcodeTrimBounds;
+    use dng_core::DngMemoryStream;
+    use dng_core::DngRect;
 
     fn sample_list() -> DngOpcodeList {
         let mut list = DngOpcodeList::new(2);
@@ -381,10 +387,13 @@ mod tests {
         list.fingerprint_to_stream(&mut stream).unwrap();
 
         stream.set_read_position(0).unwrap();
-        let data = stream.get(stream.length() as uint32).unwrap();
+        let stream_len = stream.length();
 
-        // count + opcodeID + minVersion + flags + TrimBounds data (16 bytes).
-        assert_eq!(data.len(), 4 + 4 + 4 + 4 + 16);
+        let data = stream.get(stream_len as uint32).unwrap();
+
+        // count + opcodeID + minVersion + flags + PutData (dataSize + 16-byte
+        // TrimBounds area, matching the C++ FingerprintToStream layout).
+        assert_eq!(data.len(), 4 + 4 + 4 + 4 + 4 + 16);
     }
 
     #[test]
@@ -413,15 +422,18 @@ mod tests {
         list.apply_area_scale(DngURational { n: 0, d: 0 });
         list.apply_area_scale(DngURational { n: 1, d: 1 });
 
-        // Original bounds (1,1)-(9,9): header is 16 bytes, then 4 x int32.
+        // Original bounds (1,1)-(9,9): header is 16 bytes, then dataSize (4),
+        // then 4 x int32 (matching the C++ spool layout).
         let block0 = list.spool().unwrap().unwrap();
-        assert_eq!(&block0.buffer()[16..32], &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 9, 0, 0, 0, 9]);
+        assert_eq!(&block0.buffer()[20..36], &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 9, 0, 0, 0, 9]);
 
-        // 2/1 scales the TrimBounds area -> (2,2)-(18,18).
+        // 2/1 scales area-spec-based opcodes only. TrimBounds has no
+        // ApplyAreaScale override in C++ (base is a no-op), so its bounds
+        // are unchanged.
         list.apply_area_scale(DngURational { n: 2, d: 1 });
 
         let block = list.spool().unwrap().unwrap();
-        assert_eq!(&block.buffer()[16..32], &[0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 18, 0, 0, 0, 18]);
+        assert_eq!(&block.buffer()[20..36], &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 9, 0, 0, 0, 9]);
     }
 }
 

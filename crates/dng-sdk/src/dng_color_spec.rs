@@ -9,8 +9,8 @@
 // a faithful port.
 
 use crate::dng_camera_profile::DngCameraProfile;
-use crate::dng_core::dng_temperature::DngTemperature;
-use crate::dng_core::{
+use dng_core::dng_temperature::DngTemperature;
+use dng_core::{
     abs_real64, bad_format, calculate_triple_illuminant_weights, d50_xy_coord, invert,
     invert_with_hint, max_real64, pcs_to_xy, pcs_to_xyz, pin_real64, program_error, xy_to_xyz,
     DngError, DngIlluminantData, DngMatrix, DngMatrix3by3, DngResult, DngSRational, DngVector,
@@ -72,9 +72,9 @@ pub struct DngColorSpec {
     temperature1: f64,
     temperature2: f64,
 
-    light1: crate::dng_core::DngIlluminantData,
-    light2: crate::dng_core::DngIlluminantData,
-    light3: crate::dng_core::DngIlluminantData,
+    light1: dng_core::DngIlluminantData,
+    light2: dng_core::DngIlluminantData,
+    light3: dng_core::DngIlluminantData,
 
     color_matrix1: DngMatrix,
     color_matrix2: DngMatrix,
@@ -114,9 +114,9 @@ impl DngColorSpec {
             channels,
             temperature1: 0.0,
             temperature2: 0.0,
-            light1: crate::dng_core::DngIlluminantData::default(),
-            light2: crate::dng_core::DngIlluminantData::default(),
-            light3: crate::dng_core::DngIlluminantData::default(),
+            light1: dng_core::DngIlluminantData::default(),
+            light2: dng_core::DngIlluminantData::default(),
+            light3: dng_core::DngIlluminantData::default(),
             color_matrix1: DngMatrix::new(),
             color_matrix2: DngMatrix::new(),
             color_matrix3: DngMatrix::new(),
@@ -383,7 +383,7 @@ impl DngColorSpec {
         for pass in 0..kMaxPasses {
             let xyz_to_camera = self.find_xyz_to_camera(&last, None, None, None)?;
 
-            let next = crate::dng_core::dng_xy_coord::xyz_to_xy(
+            let next = dng_core::dng_xy_coord::xyz_to_xy(
                 &invert(&xyz_to_camera)?.multiply_vector(neutral)?,
             );
 
@@ -604,7 +604,7 @@ impl DngColorSpec {
 
     /// `CalculateTripleIlluminantWeights` (wraps dng_xy_coord helper).
     fn calculate_triple_illuminant_weights(&self, white: &DngXyCoord) -> (f64, f64, f64) {
-        crate::dng_core::dng_xy_coord::calculate_triple_illuminant_weights(
+        dng_core::dng_xy_coord::calculate_triple_illuminant_weights(
             white,
             &self.light1,
             &self.light2,
@@ -627,7 +627,7 @@ fn _doc(_: DngSRational, _: DngError) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dng_core::dng_xy_coord::d65_xy_coord;
+    use dng_core::dng_xy_coord::d65_xy_coord;
 
     fn srgb_like_profile() -> DngCameraProfile {
         let mut p = DngCameraProfile::new();

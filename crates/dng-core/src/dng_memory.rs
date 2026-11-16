@@ -17,7 +17,7 @@ use crate::dng_types::{int16, int32, int64, real32, real64, uint16, uint32};
 /// Port of `dng_memory_block`: a logical-size byte buffer with physical
 /// padding (the C++ pads by 64 bytes to allow safe SIMD overread; harmless
 /// and kept for size parity).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DngMemoryBlock {
     logical_size: uint32,
     buffer: Vec<u8>,

@@ -143,6 +143,14 @@ impl PixelData {
             _ => None,
         }
     }
+
+    /// Mutable `as_u32_slice`.
+    pub fn as_u32_slice_mut(&mut self) -> Option<&mut [u32]> {
+        match self {
+            PixelData::U32(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 /// Typed element read/write dispatch.  Values are reinterpreted across
@@ -207,6 +215,9 @@ impl PixelData {
             PixelData::U8(v) => v[i] = x as u8,
             PixelData::U16(v) => v[i] = x as u16,
             PixelData::I32(v) => v[i] = x as i32,
+            // Same-width raw copy (4-byte path) must accept float storage,
+            // symmetric with get_u32.
+            PixelData::F32(v) => v[i] = real32::from_bits(x),
             _ => panic!("PixelData: bad element width for set_u32"),
         }
     }
@@ -245,6 +256,8 @@ impl PixelData {
 
 /// Port of `dng_pixel_buffer`.
 #[derive(Debug, Clone, Default)]
+
+
 pub struct DngPixelBuffer {
     /// Area this buffer holds.
     pub area: DngRect,
@@ -434,6 +447,49 @@ impl DngPixelBuffer {
 
     /// Public form of `pixel_element_index` for direct-storage fast paths
     /// (DngSimpleImage rotate/trim; extension documented in DESIGN.md).
+    // -------------------------------------------------- typed data views
+
+    /// `as_u8_slice` on the owned pixel data (None when the pixel type is
+    /// not ttByte/ttSByte).
+    pub fn as_u8_slice(&self) -> Option<&[uint8]> {
+        self.data.as_u8_slice()
+    }
+
+    /// Mutable `as_u8_slice`.
+    pub fn as_u8_slice_mut(&mut self) -> Option<&mut [uint8]> {
+        self.data.as_u8_slice_mut()
+    }
+
+    /// `as_u16_slice` on the owned pixel data (ttShort/ttSShort).
+    pub fn as_u16_slice(&self) -> Option<&[u16]> {
+        self.data.as_u16_slice()
+    }
+
+    /// Mutable `as_u16_slice`.
+    pub fn as_u16_slice_mut(&mut self) -> Option<&mut [u16]> {
+        self.data.as_u16_slice_mut()
+    }
+
+    /// `as_u32_slice` on the owned pixel data (ttLong family).
+    pub fn as_u32_slice(&self) -> Option<&[u32]> {
+        self.data.as_u32_slice()
+    }
+
+    /// Mutable `as_u32_slice`.
+    pub fn as_u32_slice_mut(&mut self) -> Option<&mut [u32]> {
+        self.data.as_u32_slice_mut()
+    }
+
+    /// `as_f32_slice` on the owned pixel data (ttFloat).
+    pub fn as_f32_slice(&self) -> Option<&[real32]> {
+        self.data.as_f32_slice()
+    }
+
+    /// Mutable `as_f32_slice`.
+    pub fn as_f32_slice_mut(&mut self) -> Option<&mut [real32]> {
+        self.data.as_f32_slice_mut()
+    }
+
     pub fn pixel_element_index_public(
         &self,
         row: int32,
@@ -1433,5 +1489,42 @@ mod tests {
         assert_eq!(b.const_pixel_u8(0, 2, 0).unwrap(), 2);
         assert_eq!(b.const_pixel_u8(3, 2, 0).unwrap(), 4);
         assert_eq!(b.const_pixel_u8(2, 3, 0).unwrap(), 4);
+    }
+}
+
+/// Index snapshot for map-opcode loops: plain values so the loops can compute
+/// pixel indices while holding a mutable slice borrow.
+#[derive(Debug, Clone, Copy)]
+pub struct PixelIndexer {
+    base: usize,
+    row_step: i64,
+    col_step: i64,
+    plane_step: i64,
+    area_t: int32,
+    area_l: int32,
+    buffer_plane: uint32,
+}
+
+impl PixelIndexer {
+    /// Capture the index state of `buffer` (plain values, no borrow held).
+    pub fn snapshot(buffer: &DngPixelBuffer) -> Self {
+        PixelIndexer {
+            base: buffer.base as usize,
+            row_step: buffer.row_step as i64,
+            col_step: buffer.col_step as i64,
+            plane_step: buffer.plane_step as i64,
+            area_t: buffer.area.t,
+            area_l: buffer.area.l,
+            buffer_plane: buffer.plane,
+        }
+    }
+
+    /// `pixel_element_index (row, col, plane)` on the captured state.
+    pub fn index(&self, row: int32, col: int32, plane: uint32) -> usize {
+        let offset = self.row_step * (row as i64 - self.area_t as i64)
+            + self.col_step * (col as i64 - self.area_l as i64)
+            + self.plane_step * (plane as i64 - self.buffer_plane as i64);
+
+        (self.base as i64 + offset) as usize
     }
 }

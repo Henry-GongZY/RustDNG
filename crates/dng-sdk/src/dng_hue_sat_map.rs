@@ -3,7 +3,7 @@
 // `dng_ref_counted_block` maps to `Arc<Vec<HSBModify>>` (ARCHITECTURE.md §8);
 // the runtime fingerprint counter is an AtomicU64.
 
-use crate::dng_core::{program_error, DngFingerprint, DngResult};
+use dng_core::{program_error, DngFingerprint, DngResult};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -94,11 +94,11 @@ impl DngHueSatMap {
 
     /// `DeltasCount ()`.
     pub fn deltas_count(&self) -> DngResult<u32> {
-        let v = crate::dng_core::dng_safe_arithmetic::safe_uint32_mult2(
+        let v = dng_core::dng_safe_arithmetic::safe_uint32_mult2(
             self.val_divisions,
             self.hue_divisions,
         )?;
-        crate::dng_core::dng_safe_arithmetic::safe_uint32_mult2(v, self.sat_divisions)
+        dng_core::dng_safe_arithmetic::safe_uint32_mult2(v, self.sat_divisions)
     }
 
     /// `GetDelta (hueDiv, satDiv, valDiv, modify)`.
@@ -255,11 +255,110 @@ impl DngHueSatMap {
 
         // Fingerprint from the inputs (MD5 of "Interpolate" + weight + both
         // runtime fingerprints), matching the C++.
-        let mut printer = crate::dng_core::dng_fingerprint::DngMd5Printer::new();
+        let mut printer = dng_core::dng_fingerprint::DngMd5Printer::new();
         printer.process(b"Interpolate");
         printer.process(&weight1.to_le_bytes());
         printer.process(&map1.runtime_fingerprint().data);
         printer.process(&map2.runtime_fingerprint().data);
+        result.set_runtime_fingerprint(*printer.result());
+
+        Ok(result)
+    }
+    /// `Interpolate (map1, map2, map3, weight1, weight2)` — the
+    /// triple-illuminant variant (dng_hue_sat_map.cpp).
+    pub fn interpolate3(
+        map1: &DngHueSatMap,
+        map2: &DngHueSatMap,
+        map3: &DngHueSatMap,
+        weight1: f64,
+        weight2: f64,
+    ) -> DngResult<DngHueSatMap> {
+        if weight1 >= 1.0 {
+            if !map1.is_valid() {
+                return Err(program_error()); // "map1 is not valid"
+            }
+            return Ok(map1.clone());
+        }
+
+        if weight2 >= 1.0 {
+            if !map2.is_valid() {
+                return Err(program_error()); // "map2 is not valid"
+            }
+            return Ok(map2.clone());
+        }
+
+        let weight3 = 1.0 - (weight1 + weight2);
+
+        if weight3 >= 1.0 {
+            if !map3.is_valid() {
+                return Err(program_error()); // "map3 is not valid"
+            }
+            return Ok(map3.clone());
+        }
+
+        // None of the weights can be negative.
+
+        if weight1 < 0.0 || weight2 < 0.0 || weight3 < 0.0 {
+            return Err(program_error()); // "Invalid weight"
+        }
+
+        // Must all be valid.
+
+        if !map1.is_valid() || !map2.is_valid() || !map3.is_valid() {
+            return Err(program_error()); // "map is not valid"
+        }
+
+        // Must have the same dimensions.
+
+        if map1.hue_divisions != map2.hue_divisions
+            || map1.hue_divisions != map3.hue_divisions
+            || map1.sat_divisions != map2.sat_divisions
+            || map1.sat_divisions != map3.sat_divisions
+            || map1.val_divisions != map2.val_divisions
+            || map1.val_divisions != map3.val_divisions
+        {
+            return Err(program_error()); // "map1, map2, map3 have different sizes"
+        }
+
+        let mut result = DngHueSatMap::new();
+        result.set_divisions(map1.hue_divisions, map1.sat_divisions, map1.val_divisions)?;
+
+        let w1 = weight1 as f32;
+        let w2 = weight2 as f32;
+        let w3 = 1.0f32 - (w1 + w2);
+
+        let data1 = map1.get_const_deltas();
+        let data2 = map2.get_const_deltas();
+        let data3 = map3.get_const_deltas();
+
+        let count = map1.deltas_count()? as usize;
+
+        {
+            let data_result: &mut Vec<HSBModify> = Arc::make_mut(&mut result.deltas);
+
+            for index in 0..count {
+                data_result[index].hue_shift = w1 * data1[index].hue_shift
+                    + w2 * data2[index].hue_shift
+                    + w3 * data3[index].hue_shift;
+                data_result[index].sat_scale = w1 * data1[index].sat_scale
+                    + w2 * data2[index].sat_scale
+                    + w3 * data3[index].sat_scale;
+                data_result[index].val_scale = w1 * data1[index].val_scale
+                    + w2 * data2[index].val_scale
+                    + w3 * data3[index].val_scale;
+            }
+        }
+
+        // Fingerprint from the inputs ("Interpolate3" + weights + all three
+        // runtime fingerprints), matching the C++.
+
+        let mut printer = dng_core::dng_fingerprint::DngMd5Printer::new();
+        printer.process(b"Interpolate3");
+        printer.process(&weight1.to_le_bytes());
+        printer.process(&weight2.to_le_bytes());
+        printer.process(&map1.runtime_fingerprint().data);
+        printer.process(&map2.runtime_fingerprint().data);
+        printer.process(&map3.runtime_fingerprint().data);
         result.set_runtime_fingerprint(*printer.result());
 
         Ok(result)

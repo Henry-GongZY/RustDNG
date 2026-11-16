@@ -1155,6 +1155,11 @@ impl<'s, 'a> TempLittleEndian<'s, 'a> {
     pub fn new(stream: &'s mut DngStream<'a>, little_endian: bool) -> Self {
         TempLittleEndian(TempBigEndian::new(stream, !little_endian))
     }
+
+    /// Access the guarded stream.
+    pub fn stream(&mut self) -> &mut DngStream<'a> {
+        self.0.stream()
+    }
 }
 
 /// Port of `TempStreamSniffer` — RAII sniffer replacement.

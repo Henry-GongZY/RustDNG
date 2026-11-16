@@ -1,6 +1,6 @@
 // Port of dng_tone_curve.h/.cpp — a monotone piecewise tone curve in [0,1].
 
-use crate::dng_core::{DngPointReal64, DngResult};
+use dng_core::{DngPointReal64, DngResult};
 
 /// Port of `dng_tone_curve`.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -60,7 +60,7 @@ impl DngToneCurve {
     /// `Solve (solver)` — feed the coordinates to a spline solver.
     pub fn solve(
         &self,
-        solver: &mut crate::dng_core::dng_1d_function::DngPiecewiseLinear,
+        solver: &mut dng_core::dng_1d_function::DngPiecewiseLinear,
     ) -> DngResult<()> {
         // PORT-NOTE(dng_tone_curve.cpp:91): the C++ feeds a dng_spline_solver;
         // the port uses the piecewise-linear 1D function for the default
@@ -116,7 +116,7 @@ mod tests {
 
         // Keep h sorted.
         tc.coord.sort_by(|a, b| a.h.partial_cmp(&b.h).unwrap());
-        let mut solver = crate::dng_core::dng_1d_function::DngPiecewiseLinear::new();
+        let mut solver = dng_core::dng_1d_function::DngPiecewiseLinear::new();
         tc.solve(&mut solver).unwrap();
         assert!(solver.is_valid());
     }

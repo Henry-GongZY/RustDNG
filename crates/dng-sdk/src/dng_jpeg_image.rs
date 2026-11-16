@@ -13,7 +13,7 @@ use dng_core::dng_point::DngPoint;
 use dng_core::dng_stream::DngStream;
 use dng_core::dng_tag_types::{ttByte, ttFloat, ttShort};
 use dng_core::dng_tag_values::{ccJXL, ccLossyJPEG, piLinearRaw, sfFloatingPoint};
-use dng_core::dng_types::{int32, real32, uint32, uint64};
+use dng_core::dng_types::{int32, real32, uint32, uint64, uint8};
 use dng_core::DngResult;
 
 /// Test helper: build a DngMemoryBlock from a byte slice.
@@ -139,6 +139,11 @@ pub struct DngLossyCompressedImage {
     pub jxl_distance: real32,
     pub jxl_effort: int32,
     pub jxl_decode_speed: int32,
+
+    /// Shared JPEG tables (`dng_jpeg_image::fJPEGTables` in C++; the port
+    /// keeps them on the base so `dng_read_image::Read` can hand them over
+    /// without a downcast — see dng_read_image.cpp:3783).
+    pub jpeg_tables_data: Option<Vec<uint8>>,
 }
 
 impl DngLossyCompressedImage {
@@ -155,6 +160,7 @@ impl DngLossyCompressedImage {
             jxl_distance: -1.0,
             jxl_effort: -1,
             jxl_decode_speed: -1,
+            jpeg_tables_data: None,
         }
     }
 
@@ -254,6 +260,11 @@ impl DngLossyCompressedImage {
     /// `JPEGTables ()` — overridden by dng_jpeg_image.
     pub fn jpeg_tables(&self) -> Option<&DngMemoryBlock> {
         None
+    }
+
+    /// Shared-table access (base slot; `DngJpegImage` returns it).
+    pub fn jpeg_tables_bytes(&self) -> Option<&[uint8]> {
+        self.jpeg_tables_data.as_deref()
     }
 
     /// `JXLDistance ()`.

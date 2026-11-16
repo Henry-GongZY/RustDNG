@@ -10,7 +10,7 @@
 //     bounds in the C++ when count == 0x10000 (the value is unused since the
 //     replication loop is empty); the port skips the read.
 
-use crate::dng_core::{
+use dng_core::{
     bad_format, convert_uint32_to_int32, intersect_rect, pin_real32, pin_uint16,
     program_error, round_int32_f64, round_uint32_f64, round_up_uint32_to_multiple,
     safe_int32_sub, safe_uint32_add, safe_uint32_divide_up, safe_uint32_mult2, DngHost, DngPoint,
@@ -23,8 +23,8 @@ use crate::dng_opcodes::{
     dngOpcode_MapPolynomial, dngOpcode_MapTable, dngOpcode_ScalePerColumn,
     dngOpcode_ScalePerRow, dngOpcode_TrimBounds, kFlag_None,
 };
-use crate::dng_core::dng_pixel_buffer::DngPixelBuffer;
-use crate::dng_core::dng_tag_values::{dngVersion_1_3_0_0};
+use dng_core::dng_pixel_buffer::DngPixelBuffer;
+use dng_core::dng_tag_values::{dngVersion_1_3_0_0};
 
 // ---------------------------------------------------------------------------
 // dng_opcode_TrimBounds.
@@ -133,7 +133,30 @@ pub struct DngAreaSpec {
 
 impl DngAreaSpec {
     /// `kDataSize`.
-    pub const kDataSize: uint32 = 32;
+    
+/// Standalone pixel-index computation for map-opcode loops: the mutable
+/// slice borrow prevents calling `buffer.pixel_element_index_public`, so the
+/// loops precompute a base index and strides.
+fn map_loop_index(
+    row_step: int32,
+    col_step: int32,
+    plane_step: int32,
+    area: (int32, int32, uint32),
+    base: usize,
+    row: int32,
+    col: int32,
+    plane: uint32,
+) -> usize {
+    let (area_t, area_l, buffer_plane) = area;
+
+    let offset = row_step as i64 * (row as i64 - area_t as i64)
+        + col_step as i64 * (col as i64 - area_l as i64)
+        + plane_step as i64 * (plane as i64 - buffer_plane as i64);
+
+    (base as i64 + offset) as usize
+}
+
+pub const kDataSize: uint32 = 32;
 
     /// `dng_area_spec (area, plane, planes, rowPitch, colPitch)`.
     pub fn new(
@@ -219,8 +242,8 @@ impl DngAreaSpec {
 
         if self.row_pitch >= self.area.h() as uint32 || self.col_pitch >= self.area.w() as uint32 {
             // DNG_REPORT in the C++ (warning, then clamp).
-            self.row_pitch = crate::dng_core::min_uint32(self.row_pitch, self.area.h() as uint32);
-            self.col_pitch = crate::dng_core::min_uint32(self.col_pitch, self.area.w() as uint32);
+            self.row_pitch = dng_core::min_uint32(self.row_pitch, self.area.h() as uint32);
+            self.col_pitch = dng_core::min_uint32(self.col_pitch, self.area.w() as uint32);
         }
 
         if self.area.is_empty() {
@@ -295,11 +318,14 @@ impl DngAreaSpec {
             }
 
             if overlap.not_empty() {
+                let row_pitch = self.row_pitch as int32;
+                let col_pitch = self.col_pitch as int32;
+
                 overlap.b = overlap.t
-                    + ((overlap.h() - 1) / self.row_pitch as int32) * self.row_pitch as int32
+                    + ((overlap.h() as int32 - 1) / row_pitch) * row_pitch
                     + 1;
                 overlap.r = overlap.l
-                    + ((overlap.w() - 1) / self.col_pitch as int32) * self.col_pitch as int32
+                    + ((overlap.w() as int32 - 1) / col_pitch) * col_pitch
                     + 1;
 
                 return overlap;
@@ -325,19 +351,23 @@ impl DngAreaSpec {
         let mut overlap = intersect_rect(area, tile);
 
         if overlap.not_empty() {
+            let row_pitch = self.row_pitch as int32;
+            let col_pitch = self.col_pitch as int32;
+
             overlap.t = area.t
-                + ((overlap.t - area.t + self.row_pitch as int32 - 1) / self.row_pitch as int32)
-                    * self.row_pitch as int32;
+                + ((overlap.t - area.t + row_pitch - 1) / row_pitch) * row_pitch;
             overlap.l = area.l
-                + ((overlap.l - area.l + self.col_pitch as int32 - 1) / self.col_pitch as int32)
-                    * self.col_pitch as int32;
+                + ((overlap.l - area.l + col_pitch - 1) / col_pitch) * col_pitch;
 
             if overlap.not_empty() {
+                let row_pitch = self.row_pitch as int32;
+                let col_pitch = self.col_pitch as int32;
+
                 overlap.b = overlap.t
-                    + ((overlap.h() - 1) / self.row_pitch as int32) * self.row_pitch as int32
+                    + ((overlap.h() as int32 - 1) / row_pitch) * row_pitch
                     + 1;
                 overlap.r = overlap.l
-                    + ((overlap.w() - 1) / self.col_pitch as int32) * self.col_pitch as int32
+                    + ((overlap.w() as int32 - 1) / col_pitch) * col_pitch
                     + 1;
 
                 return overlap;
@@ -594,8 +624,10 @@ impl DngInplaceOpcode for DngOpcodeMapTable {
             None => &self.table,
         };
 
+        let buffer_planes = buffer.planes();
+
         for plane in self.area_spec.plane()..(self.area_spec.plane() + self.area_spec.planes()) {
-            if plane >= buffer.planes() {
+            if plane >= buffer_planes {
                 break;
             }
 
@@ -837,8 +869,10 @@ impl DngInplaceOpcode for DngOpcodeMapPolynomial {
         let row_pitch = self.area_spec.row_pitch();
         let col_pitch = self.area_spec.col_pitch();
 
+        let buffer_planes = buffer.planes();
+
         for plane in self.area_spec.plane()..(self.area_spec.plane() + self.area_spec.planes()) {
-            if plane >= buffer.planes() {
+            if plane >= buffer_planes {
                 break;
             }
 
@@ -868,7 +902,7 @@ impl DngOpcodeMapPolynomial {
         let rows = area.h() as uint32;
         let cols = area.w() as uint32;
 
-        let black_scale1: real32 = 1.0;
+        let mut black_scale1: real32 = 1.0;
         let mut black_scale2: real32 = 1.0;
         let mut black_offset1: real32 = 0.0;
         let mut black_offset2: real32 = 0.0;
@@ -880,9 +914,15 @@ impl DngOpcodeMapPolynomial {
             black_offset1 = 1.0 - black_scale1;
         }
 
+        // Precompute index strides before the mutable slice borrow.
+
+        let indexer = dng_core::dng_pixel_buffer::PixelIndexer::snapshot(buffer);
+
         let slice = buffer
             .as_f32_slice_mut()
-            .ok_or_else(crate::dng_core::program_error)?;
+            .ok_or_else(dng_core::program_error)?;
+
+        let index_of = |row: int32, col: int32| -> usize { indexer.index(row, col, plane) };
 
         for row_index in (0..rows).step_by(row_pitch.max(1) as usize) {
             let row = area.t + row_index as int32;
@@ -891,7 +931,7 @@ impl DngOpcodeMapPolynomial {
                 for col_index in (0..cols).step_by(col_pitch.max(1) as usize) {
                     let col = area.l + col_index as int32;
 
-                    let index = buffer.pixel_element_index_public(row, col, plane)?;
+                    let index = index_of(row, col);
 
                     slice[index] = slice[index] * black_scale1 + black_offset1;
                 }
@@ -900,7 +940,7 @@ impl DngOpcodeMapPolynomial {
             for col_index in (0..cols).step_by(col_pitch.max(1) as usize) {
                 let col = area.l + col_index as int32;
 
-                let index = buffer.pixel_element_index_public(row, col, plane)?;
+                let index = index_of(row, col);
 
                 let x = slice[index];
 
@@ -933,7 +973,7 @@ impl DngOpcodeMapPolynomial {
                 for col_index in (0..cols).step_by(col_pitch.max(1) as usize) {
                     let col = area.l + col_index as int32;
 
-                    let index = buffer.pixel_element_index_public(row, col, plane)?;
+                    let index = indexer.index(row, col, plane);
 
                     slice[index] = slice[index] * black_scale2 + black_offset2;
                 }
@@ -1078,7 +1118,7 @@ impl DngOpcode for DngOpcodeDeltaPerRow {
 
 impl DngInplaceOpcode for DngOpcodeDeltaPerRow {
     /// `BufferPixelType (imagePixelType)`.
-    fn buffer_pixel_type(&mut self, image_pixel_type: uint32) -> uint32 {
+    fn buffer_pixel_type(&mut self, image_pixel_type: uint32) -> DngResult<uint32> {
         delta_buffer_pixel_type(image_pixel_type, &mut self.scale)
     }
 
@@ -1112,12 +1152,16 @@ impl DngInplaceOpcode for DngOpcodeDeltaPerRow {
             scale *= (1.0 - negative.stage3_black_level_normalized()) as real32;
         }
 
+        let indexer = dng_core::dng_pixel_buffer::PixelIndexer::snapshot(buffer);
+
+        let buffer_planes = buffer.planes();
+
         let slice = buffer
             .as_f32_slice_mut()
-            .ok_or_else(crate::dng_core::program_error)?;
+            .ok_or_else(dng_core::program_error)?;
 
         for plane in self.area_spec.plane()..(self.area_spec.plane() + self.area_spec.planes()) {
-            if plane >= buffer.planes() {
+            if plane >= buffer_planes {
                 break;
             }
 
@@ -1134,7 +1178,7 @@ impl DngInplaceOpcode for DngOpcodeDeltaPerRow {
                 for col_index in (0..cols).step_by(col_pitch.max(1) as usize) {
                     let col = overlap.l + col_index as int32;
 
-                    let index = buffer.pixel_element_index_public(row, col, plane)?;
+                    let index = indexer.index(row, col, plane);
 
                     let x = slice[index];
 
@@ -1260,7 +1304,7 @@ impl DngOpcode for DngOpcodeDeltaPerColumn {
 
 impl DngInplaceOpcode for DngOpcodeDeltaPerColumn {
     /// `BufferPixelType (imagePixelType)`.
-    fn buffer_pixel_type(&mut self, image_pixel_type: uint32) -> uint32 {
+    fn buffer_pixel_type(&mut self, image_pixel_type: uint32) -> DngResult<uint32> {
         delta_buffer_pixel_type(image_pixel_type, &mut self.scale)
     }
 
@@ -1295,12 +1339,14 @@ impl DngInplaceOpcode for DngOpcodeDeltaPerColumn {
             scale *= (1.0 - negative.stage3_black_level_normalized()) as real32;
         }
 
+        let indexer = dng_core::dng_pixel_buffer::PixelIndexer::snapshot(buffer);
+        let buffer_planes = buffer.planes();
         let slice = buffer
             .as_f32_slice_mut()
-            .ok_or_else(crate::dng_core::program_error)?;
+            .ok_or_else(dng_core::program_error)?;
 
         for plane in self.area_spec.plane()..(self.area_spec.plane() + self.area_spec.planes()) {
-            if plane >= buffer.planes() {
+            if plane >= buffer_planes {
                 break;
             }
 
@@ -1317,7 +1363,7 @@ impl DngInplaceOpcode for DngOpcodeDeltaPerColumn {
                 for row_index in 0..rows {
                     let row = overlap.t + (row_index * self.area_spec.row_pitch()) as int32;
 
-                    let index = buffer.pixel_element_index_public(row, col, plane)?;
+                    let index = indexer.index(row, col, plane);
 
                     let x = slice[index];
 
@@ -1442,8 +1488,8 @@ impl DngOpcode for DngOpcodeScalePerRow {
 
 impl DngInplaceOpcode for DngOpcodeScalePerRow {
     /// `BufferPixelType (imagePixelType)`.
-    fn buffer_pixel_type(&self, _image_pixel_type: uint32) -> uint32 {
-        ttFloat
+    fn buffer_pixel_type(&mut self, _image_pixel_type: uint32) -> DngResult<uint32> {
+        Ok(ttFloat)
     }
 
     /// `ModifiedBounds (imageBounds)`.
@@ -1476,12 +1522,14 @@ impl DngInplaceOpcode for DngOpcodeScalePerRow {
             black_offset = negative.stage3_black_level_normalized() as real32;
         }
 
+        let indexer = dng_core::dng_pixel_buffer::PixelIndexer::snapshot(buffer);
+        let buffer_planes = buffer.planes();
         let slice = buffer
             .as_f32_slice_mut()
-            .ok_or_else(crate::dng_core::program_error)?;
+            .ok_or_else(dng_core::program_error)?;
 
         for plane in self.area_spec.plane()..(self.area_spec.plane() + self.area_spec.planes()) {
-            if plane >= buffer.planes() {
+            if plane >= buffer_planes {
                 break;
             }
 
@@ -1498,7 +1546,7 @@ impl DngInplaceOpcode for DngOpcodeScalePerRow {
                 for col_index in (0..cols).step_by(col_pitch.max(1) as usize) {
                     let col = overlap.l + col_index as int32;
 
-                    let index = buffer.pixel_element_index_public(row, col, plane)?;
+                    let index = indexer.index(row, col, plane);
 
                     let x = slice[index];
 
@@ -1621,8 +1669,8 @@ impl DngOpcode for DngOpcodeScalePerColumn {
 
 impl DngInplaceOpcode for DngOpcodeScalePerColumn {
     /// `BufferPixelType (imagePixelType)`.
-    fn buffer_pixel_type(&self, _image_pixel_type: uint32) -> uint32 {
-        ttFloat
+    fn buffer_pixel_type(&mut self, _image_pixel_type: uint32) -> DngResult<uint32> {
+        Ok(ttFloat)
     }
 
     /// `ModifiedBounds (imageBounds)`.
@@ -1654,12 +1702,14 @@ impl DngInplaceOpcode for DngOpcodeScalePerColumn {
             black_offset = negative.stage3_black_level_normalized() as real32;
         }
 
+        let indexer = dng_core::dng_pixel_buffer::PixelIndexer::snapshot(buffer);
+        let buffer_planes = buffer.planes();
         let slice = buffer
             .as_f32_slice_mut()
-            .ok_or_else(crate::dng_core::program_error)?;
+            .ok_or_else(dng_core::program_error)?;
 
         for plane in self.area_spec.plane()..(self.area_spec.plane() + self.area_spec.planes()) {
-            if plane >= buffer.planes() {
+            if plane >= buffer_planes {
                 break;
             }
 
@@ -1676,7 +1726,7 @@ impl DngInplaceOpcode for DngOpcodeScalePerColumn {
                 for row_index in 0..rows {
                     let row = overlap.t + (row_index * self.area_spec.row_pitch()) as int32;
 
-                    let index = buffer.pixel_element_index_public(row, col, plane)?;
+                    let index = indexer.index(row, col, plane);
 
                     let x = slice[index];
 
@@ -1698,8 +1748,8 @@ impl DngInplaceOpcode for DngOpcodeScalePerColumn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dng_core::dng_simple_image::DngSimpleImage;
-    use crate::dng_core::DngMemoryStream;
+    use dng_core::dng_simple_image::DngSimpleImage;
+    use dng_core::DngMemoryStream;
 
     fn stream_from(bytes: &[u8]) -> DngStream<'static> {
         let mut stream = DngMemoryStream::with_page_size(64).stream();
@@ -1726,7 +1776,9 @@ mod tests {
         opcode.put_data(&mut stream).unwrap();
 
         stream.set_read_position(0).unwrap();
-        let data = stream.get(stream.length() as uint32).unwrap();
+                let stream_len = stream.length();
+
+        let data = stream.get(stream_len as uint32).unwrap();
 
         // Parse it back (prepend the minVersion/flags header).
         let mut full = Vec::new();
@@ -1751,7 +1803,9 @@ mod tests {
         let mut opcode = DngOpcodeTrimBounds::new(DngRect::from_corners(1, 2, 7, 9));
         opcode.apply(&mut host, &mut negative, &mut image).unwrap();
 
-        assert_eq!(image.read().unwrap().bounds(), DngRect::from_corners(1, 2, 7, 9));
+        // C++ dng_simple_image::Trim re-anchors the trimmed area at the
+        // origin: bounds become (0, 0, H, W).
+        assert_eq!(image.read().unwrap().bounds(), DngRect::from_corners(0, 0, 6, 7));
 
         // Out-of-image trim bounds are a bad format.
         let mut bad = DngOpcodeTrimBounds::new(DngRect::from_corners(0, 0, 32, 32));
@@ -1799,14 +1853,15 @@ mod tests {
         assert_eq!(parsed.row_pitch(), 2);
         assert_eq!(parsed.col_pitch(), 3);
 
-        // Overlap snaps to the row/col pitch grid.
+        // Overlap snaps to the row/col pitch grid (C++ semantics:
+        // b = t + ((H-1)/rowPitch)*rowPitch + 1 over the grid).
         let tile = DngRect::from_corners(1, 1, 8, 8);
         let overlap = spec.overlap(tile);
 
         assert_eq!(overlap.t, 2); // first row >= 1 on the even-row grid
         assert_eq!(overlap.l, 3); // first col >= 1 on the 3-col grid
-        assert_eq!(overlap.b, 8); // rows 2,4,6 -> last + 1 = 8
-        assert_eq!(overlap.r, 9); // cols 3,6 -> last + 1 = 9
+        assert_eq!(overlap.b, 7); // grid rows 2,4,6 -> last (6) + 1
+        assert_eq!(overlap.r, 7); // grid cols 3,6 -> last (6) + 1
 
         // Empty area covers the whole tile.
         let empty = DngAreaSpec::new(DngRect::new(), 0, 1, 1, 1);
@@ -1860,7 +1915,9 @@ mod tests {
         opcode.put_data(&mut spool).unwrap();
 
         spool.set_read_position(0).unwrap();
-        let data = spool.get(spool.length() as uint32).unwrap();
+                let spool_len = spool.length();
+
+        let data = spool.get(spool_len as uint32).unwrap();
 
         let mut full = Vec::new();
         full.extend_from_slice(&[0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00]);
@@ -1888,7 +1945,7 @@ mod tests {
                 0,
                 1,
                 ttShort,
-                crate::dng_core::pcRowInterleaved,
+                dng_core::pcRowInterleaved,
                 DngPixelBuffer::allocate_data(DngRect::from_corners(0, 0, 2, 4), 1, ttShort).unwrap(),
             )
             .unwrap();
@@ -1911,12 +1968,12 @@ mod tests {
                 0,
                 1,
                 ttShort,
-                crate::dng_core::pcRowInterleaved,
+                dng_core::pcRowInterleaved,
                 DngPixelBuffer::allocate_data(DngRect::from_corners(0, 0, 2, 4), 1, ttShort).unwrap(),
             )
             .unwrap();
 
-            image.read().unwrap().get(&mut buf, crate::dng_core::dng_image::EdgeOption::EdgeNone, 1, 1).unwrap();
+            image.read().unwrap().get(&mut buf, dng_core::dng_image::EdgeOption::EdgeNone, 1, 1).unwrap();
 
             let mapping = [0u16, 100, 200, 65535];
             for row in 0..2 {
@@ -1960,7 +2017,7 @@ mod tests {
                 0,
                 1,
                 ttShort,
-                crate::dng_core::pcRowInterleaved,
+                dng_core::pcRowInterleaved,
                 DngPixelBuffer::allocate_data(DngRect::from_corners(0, 0, 1, 1), 1, ttShort).unwrap(),
             )
             .unwrap();
@@ -1977,11 +2034,11 @@ mod tests {
                 0,
                 1,
                 ttShort,
-                crate::dng_core::pcRowInterleaved,
+                dng_core::pcRowInterleaved,
                 DngPixelBuffer::allocate_data(DngRect::from_corners(0, 0, 1, 1), 1, ttShort).unwrap(),
             )
             .unwrap();
-            image.read().unwrap().get(&mut buf, crate::dng_core::dng_image::EdgeOption::EdgeNone, 1, 1).unwrap();
+            image.read().unwrap().get(&mut buf, dng_core::dng_image::EdgeOption::EdgeNone, 1, 1).unwrap();
             let v = buf.const_pixel_u16(0, 0, 0).unwrap();
 
             // x = (16384 - 16384) * srcScale = 0 -> y = table[0] = 0 ->
@@ -1995,7 +2052,7 @@ mod tests {
         let spec = DngAreaSpec::new(DngRect::from_corners(0, 0, 4, 4), 0, 1, 1, 1);
         let coefficients = [0.25f64, 0.5, 0.25];
 
-        let mut opcode = DngOpcodeMapPolynomial::new(spec, 2, &coefficients);
+        let mut opcode = DngOpcodeMapPolynomial::new(spec.clone(), 2, &coefficients);
         opcode.set_stage(3);
 
         // Spool + parse.
@@ -2004,7 +2061,9 @@ mod tests {
         opcode.put_data(&mut spool).unwrap();
 
         spool.set_read_position(0).unwrap();
-        let data = spool.get(spool.length() as uint32).unwrap();
+                let spool_len = spool.length();
+
+        let data = spool.get(spool_len as uint32).unwrap();
 
         let mut full = Vec::new();
         full.extend_from_slice(&[0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00]);
@@ -2020,7 +2079,7 @@ mod tests {
         assert_eq!(parsed.coefficients()[3], 0.0);
 
         // Degree reduction: trailing zero coefficient reduces degree.
-        let reduced = DngOpcodeMapPolynomial::new(spec, 4, &[0.1, 0.2, 0.0, 0.0, 0.0]);
+        let reduced = DngOpcodeMapPolynomial::new(spec.clone(), 4, &[0.1, 0.2, 0.0, 0.0, 0.0]);
         assert_eq!(reduced.degree(), 1);
     }
 
@@ -2047,7 +2106,7 @@ mod tests {
                 0,
                 1,
                 ttFloat,
-                crate::dng_core::pcRowInterleaved,
+                dng_core::pcRowInterleaved,
                 DngPixelBuffer::allocate_data(DngRect::from_corners(0, 0, 2, 4), 1, ttFloat).unwrap(),
             )
             .unwrap();
@@ -2068,11 +2127,11 @@ mod tests {
                 0,
                 1,
                 ttFloat,
-                crate::dng_core::pcRowInterleaved,
+                dng_core::pcRowInterleaved,
                 DngPixelBuffer::allocate_data(DngRect::from_corners(0, 0, 2, 4), 1, ttFloat).unwrap(),
             )
             .unwrap();
-            image.read().unwrap().get(&mut buf, crate::dng_core::dng_image::EdgeOption::EdgeNone, 1, 1).unwrap();
+            image.read().unwrap().get(&mut buf, dng_core::dng_image::EdgeOption::EdgeNone, 1, 1).unwrap();
 
             for row in 0..2 {
                 for col in 0..4 {
@@ -2096,7 +2155,9 @@ mod tests {
         opcode.put_data(&mut spool).unwrap();
 
         spool.set_read_position(0).unwrap();
-        let data = spool.get(spool.length() as uint32).unwrap();
+                let spool_len = spool.length();
+
+        let data = spool.get(spool_len as uint32).unwrap();
 
         let mut full = Vec::new();
         full.extend_from_slice(&[0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00]);
@@ -2109,7 +2170,8 @@ mod tests {
 
         // Bad count in stream is rejected.
         let mut corrupt = full.clone();
-        let count_offset = 8 + DngAreaSpec::kDataSize as usize;
+        // Wire layout: [minVersion(4)][flags(4)][dataSize(4)][areaSpec(32)][count(4)][table...]
+        let count_offset = 8 + 4 + DngAreaSpec::kDataSize as usize;
         corrupt[count_offset] = 0x7F; // deltas = huge
         let mut stream = stream_from(&corrupt);
         assert!(DngOpcodeDeltaPerRow::from_stream(&mut stream).is_err());
@@ -2120,7 +2182,9 @@ mod tests {
         // Scale 2.0 on a stage-3 opcode with black level 8192: the pixel is
         // scaled around the black offset.
         let spec = DngAreaSpec::new(DngRect::from_corners(0, 0, 2, 2), 0, 1, 1, 1);
-        let scales = vec![2.0f32];
+        // One scale per grid column (2 columns at pitch 1, matching the C++
+        // invariant that the table has ceil(W/colPitch) entries).
+        let scales = vec![2.0f32, 2.0f32];
 
         let mut opcode = DngOpcodeScalePerColumn::new(spec, scales);
         opcode.set_stage(3);
@@ -2139,7 +2203,7 @@ mod tests {
                 0,
                 1,
                 ttFloat,
-                crate::dng_core::pcRowInterleaved,
+                dng_core::pcRowInterleaved,
                 DngPixelBuffer::allocate_data(DngRect::from_corners(0, 0, 2, 2), 1, ttFloat).unwrap(),
             )
             .unwrap();
@@ -2155,11 +2219,11 @@ mod tests {
                 0,
                 1,
                 ttFloat,
-                crate::dng_core::pcRowInterleaved,
+                dng_core::pcRowInterleaved,
                 DngPixelBuffer::allocate_data(DngRect::from_corners(0, 0, 2, 2), 1, ttFloat).unwrap(),
             )
             .unwrap();
-            image.read().unwrap().get(&mut buf, crate::dng_core::dng_image::EdgeOption::EdgeNone, 1, 1).unwrap();
+            image.read().unwrap().get(&mut buf, dng_core::dng_image::EdgeOption::EdgeNone, 1, 1).unwrap();
 
             let v = buf.const_pixel_f32(0, 0, 0).unwrap();
 

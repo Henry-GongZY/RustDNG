@@ -4,9 +4,9 @@
 // views); the interpolator is a 1:1 port of the cpp-local
 // `dng_gain_map_interpolator` class.
 
-use crate::dng_core::dng_exceptions::program_error;
-use crate::dng_core::dng_fingerprint::DngFingerprint;
-use crate::dng_core::{
+use dng_core::dng_exceptions::program_error;
+use dng_core::dng_fingerprint::DngFingerprint;
+use dng_core::{
     compute_buffer_size, convert_double_to_int32, DngPoint, DngPointReal64, DngRect, DngResult,
     DngStream, PaddingType, ttFloat,
 };
@@ -30,7 +30,7 @@ impl DngGainMap {
         origin: DngPointReal64,
         planes: u32,
     ) -> DngResult<Self> {
-        let row_step = crate::dng_core::dng_safe_arithmetic::safe_uint32_mult2(planes, points.h as u32)?;
+        let row_step = dng_core::dng_safe_arithmetic::safe_uint32_mult2(planes, points.h as u32)?;
 
         let bytes = compute_buffer_size(ttFloat, points, planes, PaddingType::padSIMDBytes)?;
         let floats = (bytes / 4) as usize;
@@ -412,12 +412,337 @@ impl DngGainTableMap {
     }
 
     /// `SetFingerprint / GetFingerprint` — cached digest of the wire format.
+    /// `GetStream (host, stream, useVersion2)` (dng_gain_map.cpp).
+    pub fn get_stream_gtm(stream: &mut dng_core::DngStream, use_version2: bool) -> DngResult<Self> {
+        let map_points = dng_core::DngPoint::new(
+            stream.get_uint32()? as i32,
+            stream.get_uint32()? as i32,
+        );
+
+        let map_spacing = dng_core::DngPointReal64::new(
+            stream.get_real64()?,
+            stream.get_real64()?,
+        );
+
+        let map_origin = dng_core::DngPointReal64::new(
+            stream.get_real64()?,
+            stream.get_real64()?,
+        );
+
+        let num_table_points = stream.get_uint32()?;
+
+        let mut weights = [0.0f32; 5];
+
+        for weight in weights.iter_mut() {
+            *weight = stream.get_real32()?;
+        }
+
+        let mut data_type: u32 = 3;
+        let mut gamma: f32 = 1.0;
+        let mut gain_min: f32 = 1.0;
+        let mut gain_max: f32 = 1.0;
+
+        if use_version2 {
+            data_type = stream.get_uint32()?;
+            gamma = stream.get_real32()?;
+            gain_min = stream.get_real32()?;
+            gain_max = stream.get_real32()?;
+
+            if !(dng_core::dng_sdk_limits::kProfileGainTableMap_MinGamma
+                ..=dng_core::dng_sdk_limits::kProfileGainTableMap_MaxGamma)
+                .contains(&gamma)
+            {
+                return Err(dng_core::bad_format()); // "Gamma out of range"
+            }
+
+            if data_type > 3 {
+                return Err(dng_core::bad_format()); // "Unsupported DataType"
+            }
+
+            if gamma < dng_core::dng_sdk_limits::kProfileGainTableMap_MinGainValue {
+                return Err(dng_core::bad_format()); // "GainMin out of range"
+            }
+
+            if gamma > dng_core::dng_sdk_limits::kProfileGainTableMap_MaxGainValue {
+                return Err(dng_core::bad_format()); // "GainMax out of range"
+            }
+        }
+
+        let mut result = DngGainTableMap::new(
+            map_points,
+            map_spacing,
+            map_origin,
+            num_table_points,
+            &weights,
+            data_type,
+            gamma,
+            gain_min,
+            gain_max,
+        )?;
+
+        // Read the gain samples (uint16 wire format).
+
+        let sample_count = result.num_samples() as usize;
+
+        {
+            let buffer = result.buffer_mut();
+
+            for index in 0..sample_count {
+                // C++ reads real16 samples (half floats on the wire).
+
+                let bits = stream.get_uint16_half()?;
+
+                buffer[index] = half::f16::from_bits(bits).to_f32();
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// `GetStream` without version-2 fields (matching the C++ default).
+    pub fn get_stream(stream: &mut dng_core::DngStream) -> DngResult<Self> {
+        Self::get_stream_gtm(stream, false)
+    }
+
+    /// Mutable access to the gain sample buffer.
+    pub fn buffer_mut(&mut self) -> &mut [f32] {
+        &mut self.buffer
+    }
+
     pub fn set_fingerprint(&self, fp: DngFingerprint) {
         self.fingerprint.set(fp);
     }
 
     pub fn get_fingerprint(&self) -> DngFingerprint {
         self.fingerprint.get()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dng_opcode_GainMap (dng_gain_map.h:170 / dng_gain_map.cpp:1239).
+// ---------------------------------------------------------------------------
+
+/// Port of `dng_opcode_GainMap` — apply a gain map to an image (in-place
+/// opcode).
+pub struct DngOpcodeGainMap {
+    base: crate::dng_opcodes::DngOpcodeBase,
+
+    /// `fAreaSpec`.
+    area_spec: crate::dng_misc_opcodes::DngAreaSpec,
+
+    /// `fGainMap`.
+    gain_map: Option<DngGainMap>,
+}
+
+impl DngOpcodeGainMap {
+    /// `dng_opcode_GainMap (areaSpec, gainMap, flags)`.
+    pub fn new_with_map(
+        area_spec: crate::dng_misc_opcodes::DngAreaSpec,
+        gain_map: DngGainMap,
+        flags: dng_core::uint32,
+    ) -> Self {
+        DngOpcodeGainMap {
+            base: crate::dng_opcodes::DngOpcodeBase::new(
+                crate::dng_opcodes::dngOpcode_GainMap,
+                dng_core::dngVersion_1_3_0_0,
+                flags,
+            ),
+            area_spec,
+            gain_map: Some(gain_map),
+        }
+    }
+
+    /// `dng_opcode_GainMap (host, stream)`.
+    pub fn from_stream(stream: &mut dng_core::DngStream) -> DngResult<Self> {
+        let base = crate::dng_opcodes::DngOpcodeBase::from_stream(
+            crate::dng_opcodes::dngOpcode_GainMap,
+            stream,
+        )?;
+
+        let byte_count = stream.get_uint32()?;
+
+        let start_position = stream.position();
+
+        let mut area_spec = crate::dng_misc_opcodes::DngAreaSpec::default();
+        area_spec.get_data(stream)?;
+
+        let gain_map = DngGainMap::get_stream(stream)?;
+
+        if stream.position() != start_position + byte_count as u64 {
+            return Err(dng_core::bad_format());
+        }
+
+        Ok(DngOpcodeGainMap {
+            base,
+            area_spec,
+            gain_map: Some(gain_map),
+        })
+    }
+
+    /// `PutData (stream)`.
+    pub fn put_data(&self, stream: &mut dng_core::DngStream) -> DngResult<()> {
+        let gain_map = self.gain_map.as_ref().ok_or_else(dng_core::program_error)?;
+
+        stream.put_uint32(
+            crate::dng_misc_opcodes::DngAreaSpec::kDataSize + gain_map.put_stream_size(),
+        )?;
+
+        self.area_spec.put_data(stream)?;
+
+        gain_map.put_stream(stream)
+    }
+
+    /// `ProcessArea (negative, threadIndex, buffer, dstArea, imageBounds)`.
+    pub fn process_area_impl(
+        &mut self,
+        negative: &crate::dng_negative::DngNegative,
+        buffer: &mut dng_core::dng_pixel_buffer::DngPixelBuffer,
+        dst_area: dng_core::DngRect,
+        image_bounds: dng_core::DngRect,
+    ) -> DngResult<()> {
+        let gain_map = self.gain_map.as_ref().ok_or_else(dng_core::program_error)?;
+
+        let overlap = self.area_spec.scaled_overlap(dst_area);
+
+        if overlap.not_empty() {
+            let black_level = if self.base.stage >= 2 {
+                negative.stage3_black_level()
+            } else {
+                0
+            };
+
+            let mut black_scale1: f32 = 1.0;
+            let mut black_scale2: f32 = 1.0;
+            let mut black_offset1: f32 = 0.0;
+            let mut black_offset2: f32 = 0.0;
+
+            if black_level != 0 {
+                black_offset2 = (black_level as f32) / 65535.0;
+                black_scale2 = 1.0 - black_offset2;
+                black_scale1 = 1.0 / black_scale2;
+                black_offset1 = 1.0 - black_scale1;
+            }
+
+            let cols = overlap.w() as usize;
+
+            let mut col_pitch = self.area_spec.col_pitch() as usize;
+
+            col_pitch = col_pitch.min(cols.max(1)).max(1);
+
+            let planes = self.area_spec.planes();
+
+            for plane in self.area_spec.plane()..self.area_spec.plane() + planes {
+                if plane >= buffer.planes() {
+                    break;
+                }
+
+                let map_plane = plane.min(gain_map.planes() - 1);
+
+                let base =
+                    buffer.pixel_element_index_public(overlap.t, overlap.l, plane)?;
+
+                let row_step = buffer.row_step as usize;
+
+                let dst = buffer.as_f32_slice_mut().unwrap();
+
+                let mut row = overlap.t;
+
+                while row < overlap.b {
+                    let mut interp = GainMapInterpolator::new(
+                        gain_map,
+                        image_bounds,
+                        row,
+                        overlap.l,
+                        map_plane,
+                    )?;
+
+                    let row_base = base
+                        + ((row - overlap.t) as usize) * row_step;
+
+                    if black_level != 0 {
+                        let mut col = 0usize;
+
+                        while col < cols {
+                            let index = row_base + col;
+
+                            if index < dst.len() {
+                                dst[index] = dst[index] * black_scale1 + black_offset1;
+                            }
+
+                            col += col_pitch;
+                        }
+                    }
+
+                    let mut col = 0usize;
+
+                    while col < cols {
+                        let gain = interp.interpolate();
+
+                        let index = row_base + col;
+
+                        if index < dst.len() {
+                            dst[index] = dng_core::dng_utils::min_real32(dst[index] * gain, 1.0);
+                        }
+
+                        for _ in 0..col_pitch {
+                            interp.increment()?;
+                        }
+
+                        col += col_pitch;
+                    }
+
+                    row += self.area_spec.row_pitch() as i32;
+                }
+            }
+
+            let _ = (black_scale2, black_offset2);
+        }
+
+        Ok(())
+    }
+}
+
+impl crate::dng_opcodes::DngOpcode for DngOpcodeGainMap {
+    fn base(&self) -> &crate::dng_opcodes::DngOpcodeBase {
+        &self.base
+    }
+
+    fn base_mut(&mut self) -> &mut crate::dng_opcodes::DngOpcodeBase {
+        &mut self.base
+    }
+
+    /// `PutData (stream)`.
+    fn put_data(&self, stream: &mut dng_core::DngStream) -> DngResult<()> {
+        self.put_data(stream)
+    }
+
+    /// `Apply` — in-place (delegates to the in-place driver).
+    fn apply(
+        &mut self,
+        _host: &mut dng_core::DngHost,
+        negative: &mut crate::dng_negative::DngNegative,
+        image: &mut dng_core::ImageRef,
+    ) -> DngResult<()> {
+        crate::dng_opcodes::apply_inplace_opcode(self, negative, image)
+    }
+}
+
+impl crate::dng_opcodes::DngInplaceOpcode for DngOpcodeGainMap {
+    /// `BufferPixelType (imagePixelType)` — gain maps apply to float data.
+    fn buffer_pixel_type(&mut self, _image_pixel_type: dng_core::uint32) -> DngResult<dng_core::uint32> {
+        Ok(dng_core::dng_tag_types::ttFloat)
+    }
+
+    /// `ProcessArea (negative, threadIndex, buffer, dstArea, imageBounds)`.
+    fn process_area(
+        &mut self,
+        negative: &mut crate::dng_negative::DngNegative,
+        _thread_index: dng_core::uint32,
+        buffer: &mut dng_core::dng_pixel_buffer::DngPixelBuffer,
+        dst_area: dng_core::DngRect,
+        image_bounds: dng_core::DngRect,
+    ) -> DngResult<()> {
+        self.process_area_impl(negative, buffer, dst_area, image_bounds)
     }
 }
 
@@ -445,7 +770,7 @@ mod tests {
         assert_eq!(map.entry(1, 2, 1), 2.5);
 
         // Stream round trip.
-        let mut stream = crate::dng_core::dng_memory_stream::DngMemoryStream::new().stream();
+        let mut stream = dng_core::dng_memory_stream::DngMemoryStream::new().stream();
         map.put_stream(&mut stream).unwrap();
         stream.set_read_position(0).unwrap();
 

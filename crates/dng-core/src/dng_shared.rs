@@ -169,15 +169,34 @@ impl DngCameraProfileInfo {
                 if !check_tag_type(parent_code, tag_code, tag_type, &[ttSRational as uint16]) {
                     return Ok(false);
                 }
-                // Plane count is implicit: rows*cols == count.
-                // Default 3x3; dng_shared::PostParse adjusts for 4-color.
-                if tag_count % 3 != 0 {
+
+                // C++ (dng_shared.cpp): infer the color-plane count from the
+                // tag count when unknown, then require tagCount == planes*3.
+
+                if self.color_planes == 0 {
+                    self.color_planes = crate::dng_utils::pin_uint32(
+                        0,
+                        tag_count / 3,
+                        crate::dng_sdk_limits::kMaxColorPlanes,
+                    );
+                }
+
+                if !check_color_image(parent_code, tag_code, self.color_planes) {
                     return Ok(false);
                 }
-                let rows = 3;
-                let cols = tag_count / rows;
+
+                if tag_count != self.color_planes * 3 {
+                    return Ok(false);
+                }
+
                 if let Some(m) = parse_matrix_tag(
-                    stream, parent_code, tag_code, tag_type, tag_count, rows, cols,
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_type,
+                    tag_count,
+                    self.color_planes,
+                    3,
                 )? {
                     self.color_matrix1 = m;
                 }
@@ -379,6 +398,9 @@ pub struct DngShared {
     pub big_table_offsets: Vec<uint64>,
     pub big_table_byte_counts: Vec<uint32>,
 
+    /// Group index pairs for BigTable resources (dng_big_table group index).
+    pub big_table_group_index: Vec<(DngFingerprint, DngFingerprint)>,
+
     pub image_sequence_info: crate::dng_utils::DngImageSequenceInfo,
 }
 
@@ -416,6 +438,28 @@ impl DngShared {
         offset_delta: int64,
     ) -> DngResult<bool> {
         let _ = (is_main_ifd, offset_delta);
+
+        // Camera-profile tags live on fCameraProfile in the C++
+        // (dng_shared::ParseTag handles them inline on the embedded
+        // profile-info struct); delegate those first.
+        match tag_code {
+            x if x == tcCalibrationIlluminant1
+                || x == tcCalibrationIlluminant2
+                || x == tcCalibrationIlluminant3
+                || x == tcColorMatrix1
+                || x == tcColorMatrix2
+                || x == tcProfileCalibrationSignature
+                || x == tcProfileCopyright
+                || x == tcProfileHueSatMapDims
+                || x == tcProfileName
+                || x == tcProfileToneCurve =>
+            {
+                return self
+                    .camera_profile
+                    .parse_tag(stream, parent_code, tag_code, tag_type, tag_count, tag_offset);
+            }
+            _ => {}
+        }
 
         match tag_code {
             x if x == tcDNGVersion => {
@@ -861,31 +905,66 @@ impl DngShared {
         Ok(true)
     }
 
-    /// `IsValidDNG ()` — the structural checks on the shared tags.
+    /// `dng_shared::IsValidDNG ()` — C++-faithful: checks the DNGVersion
+    /// floor, the DNGBackwardVersion ceiling, and (for multi-plane images)
+    /// the size/invertibility of the optional camera calibrations and the
+    /// analog balance. Note the C++ deliberately does NOT require a color
+    /// matrix or AsShotNeutral here (monochrome DNGs have neither).
     pub fn is_valid_dng(&self) -> bool {
-        // DNGVersion must exist and be at least 1.1.0.0.
-        if self.dng_version < dngVersion_1_1_0_0 {
+        // Check DNGVersion value.
+
+        if self.dng_version < dngVersion_1_0_0_0 {
             return false;
         }
 
-        // Must have a camera profile with a color matrix.
-        if self.camera_profile.color_planes < 1 {
+        // Check DNGBackwardVersion value. The C++ throws
+        // ThrowUnsupportedDNG here; this bool predicate reports it as
+        // invalid (PORT-NOTE: throw -> false).
+
+        if self.dng_backward_version > dngVersion_Current {
             return false;
         }
 
-        // ColorMatrix1 must be present.
-        if self.camera_profile.color_matrix1.rows() == 0 {
-            return false;
-        }
+        // Check color transform info.
 
-        // AsShotNeutral or AsShotWhiteXY must exist.
-        if self.as_shot_neutral.is_none() && self.as_shot_white_xy.not_valid() {
-            return false;
-        }
+        if self.camera_profile.color_planes > 1 {
+            let planes = self.camera_profile.color_planes;
 
-        // CFA images must have a valid CFA pattern.
-        if self.camera_profile.color_planes == 3 {
-            // (CFA specifics are checked in dng_ifd::IsValidCFA.)
+            // CameraCalibration1/2/3 are optional, but each must be the
+            // right size and invertible if present.
+
+            for calib in [
+                &self.camera_calibration1,
+                &self.camera_calibration2,
+                &self.camera_calibration3,
+            ] {
+                if calib.cols() != 0 || calib.rows() != 0 {
+                    if calib.cols() != planes || calib.rows() != planes {
+                        return false;
+                    }
+
+                    // Make sure it is invertible.
+
+                    if calib.inverted().is_err() {
+                        return false;
+                    }
+                }
+            }
+
+            // Check analog balance.
+
+            if let Some(analog_balance) = &self.analog_balance {
+                if !analog_balance.is_empty() {
+                    match analog_balance.as_diagonal() {
+                        Ok(diag) => {
+                            if diag.inverted().is_err() {
+                                return false;
+                            }
+                        }
+                        Err(_) => return false,
+                    }
+                }
+            }
         }
 
         true
@@ -954,10 +1033,12 @@ mod tests {
     #[test]
     fn is_valid_dng_requirements() {
         let mut shared = DngShared::new();
-        assert!(!shared.is_valid_dng()); // no version
+        assert!(!shared.is_valid_dng()); // no version (C++: < dngVersion_1_0_0_0)
 
+        // Version alone is enough: the C++ IsValidDNG does not require a
+        // color matrix or AsShotNeutral (monochrome DNGs have neither).
         shared.dng_version = dngVersion_1_4_0_0;
-        assert!(!shared.is_valid_dng()); // no profile
+        assert!(shared.is_valid_dng());
 
         shared.camera_profile.color_planes = 3;
         shared.camera_profile.color_matrix1 =
@@ -965,6 +1046,12 @@ mod tests {
         shared.as_shot_neutral =
             Some(crate::dng_matrix::DngVector::from_values(&[1.0, 1.0, 1.0]).unwrap());
         assert!(shared.is_valid_dng());
+
+        // A wrong-size or non-invertible camera calibration invalidates.
+
+        shared.camera_calibration1 =
+            DngMatrix::from_rows(3, 3, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]).unwrap();
+        assert!(!shared.is_valid_dng()); // singular calibration1
     }
 
     #[test]

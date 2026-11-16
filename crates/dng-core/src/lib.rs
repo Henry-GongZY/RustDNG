@@ -104,4 +104,25 @@ pub use dng_types::*;
 pub use dng_utils::{force_uppercase, pin_int32, pin_uint16, pin_uint32, round_int32_f64, round_uint32_f64, compute_buffer_size, PaddingType};
 pub use dng_safe_arithmetic::convert_double_to_int32;
 
+pub use dng_host::DngHost;
+pub use dng_orientation::DngOrientation;
+pub use dng_1d_function::Dng1dFunction;
+pub use dng_1d_table::Dng1dTable;
+pub use dng_resample::{
+    DngResampleBicubic, DngResampleFunction, DngResampleWeights, DngResampleWeights2d,
+    kResampleSubsampleBits2D, kResampleSubsampleCount2D, kResampleSubsampleMask2D,
+};
+pub use dng_utils::{
+    abs_real32, lerp_real64, max_int32, max_real32, max_uint32, min_int32, min_real32, min_uint32,
+    pin_real32, real64_to_fixed64, max_distance_point_to_rect, min_uint32_3, max_uint32_3,
+};
+pub use dng_rect::intersect_rect;
+pub use dng_pixel_buffer::{DngPixelBuffer, PixelData};
+pub use dng_safe_arithmetic::{
+    convert_double_to_float, convert_uint32_to_int32, round_up_uint32_to_multiple,
+    safe_int32_sub, safe_uint32_add, safe_uint32_divide_up, safe_uint32_mult2,
+    safe_uint32_sub, safe_uint64_add,
+};
+
+
 

@@ -13,13 +13,14 @@
 //   * `dng_host::Make_dng_opcode` becomes the free function `make_dng_opcode`
 //     (DngHost lives in dng-core and must not depend on sdk opcodes).
 
-use crate::dng_core::{
+use dng_core::{
     bad_format, memory_full, DngHost, DngPoint, DngRect, DngResult, DngStream, DngURational,
-    ImageRef, uint32,
+    ImageRef, uint32, uint8,
 };
-use crate::dng_core::dng_image::{DngPixelBuffer, EdgeOption};
-use crate::dng_core::dng_simple_image::DngSimpleImage;
-use crate::dng_core::dng_tile_iterator::DngTileIterator;
+use dng_core::DngPixelBuffer;
+use dng_core::dng_image::EdgeOption;
+use dng_core::dng_simple_image::DngSimpleImage;
+use dng_core::dng_tile_iterator::DngTileIterator;
 use crate::dng_negative::DngNegative;
 
 /// \brief List of supported opcodes (by ID) — C++ `enum dng_opcode_id`.
@@ -171,7 +172,7 @@ pub trait DngOpcode: Send {
     ) -> DngResult<bool> {
         if self.skip_if_preview() && host.for_preview() {
             negative.set_is_preview(true);
-        } else if self.min_version() > crate::dng_core::dngVersion_Current
+        } else if self.min_version() > dng_core::dngVersion_Current
             && self.was_read_from_stream()
         {
             if !self.optional() {
@@ -403,7 +404,7 @@ pub fn apply_filter_opcode<O: DngFilterOpcode + ?Sized>(
             0,
             image_planes,
             src_pixel_type,
-            crate::dng_core::pcRowInterleavedAlignSIMD,
+            dng_core::pcRowInterleavedAlignSIMD,
             DngPixelBuffer::allocate_data_simd(src_area, image_planes, src_pixel_type)?,
         )?;
 
@@ -422,16 +423,18 @@ pub fn apply_filter_opcode<O: DngFilterOpcode + ?Sized>(
             0,
             image_planes,
             dst_pixel_type,
-            crate::dng_core::pcRowInterleavedAlignSIMD,
+            dng_core::pcRowInterleavedAlignSIMD,
             DngPixelBuffer::allocate_data_simd(tile, image_planes, dst_pixel_type)?,
         )?;
+
+        let dst_area = dst_buffer.area;
 
         opcode.process_area(
             negative,
             0, // threadIndex — serial port
             &mut src_buffer,
             &mut dst_buffer,
-            dst_buffer.area,
+            dst_area,
             image_bounds,
         )?;
 
@@ -515,7 +518,7 @@ pub fn apply_inplace_opcode<O: DngInplaceOpcode + ?Sized>(
         return Ok(());
     }
 
-    let pixel_type = opcode.buffer_pixel_type(image_pixel_type);
+    let pixel_type = opcode.buffer_pixel_type(image_pixel_type)?;
 
     let max_tile_size = DngPoint::new(1024, 1024);
 
@@ -539,7 +542,7 @@ pub fn apply_inplace_opcode<O: DngInplaceOpcode + ?Sized>(
             0,
             image_planes,
             pixel_type,
-            crate::dng_core::pcRowInterleavedAlignSIMD,
+            dng_core::pcRowInterleavedAlignSIMD,
             DngPixelBuffer::allocate_data_simd(tile, image_planes, pixel_type)?,
         )?;
 
@@ -635,9 +638,9 @@ pub fn make_dng_opcode(opcode_id: uint32, stream: &mut DngStream) -> DngResult<B
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dng_core::dng_simple_image::DngSimpleImage;
-    use crate::dng_core::ttFloat;
-    use crate::dng_core::{DngMemoryStream, dngVersion_Current};
+    use dng_core::dng_simple_image::DngSimpleImage;
+    use dng_core::ttFloat;
+    use dng_core::{DngMemoryStream, dngVersion_Current};
 
     fn stub_stream(bytes: &[u8]) -> DngStream<'static> {
         let mut stream = DngMemoryStream::with_page_size(64).stream();
@@ -697,7 +700,9 @@ mod tests {
         opcode.put_data(&mut out).unwrap();
 
         out.set_read_position(0).unwrap();
-        let spooled = out.get(out.length() as uint32).unwrap();
+        let out_len = out.length();
+
+        let spooled = out.get(out_len as uint32).unwrap();
         assert_eq!(
             spooled,
             vec![0, 0, 0, 4, 0xDE, 0xAD, 0xBE, 0xEF]
@@ -724,6 +729,7 @@ mod tests {
 
         // Optional unknown opcodes are skipped.
         let mut negative = crate::dng_negative::DngNegative::new(&mut host).unwrap();
+        let mut image = image;
         opcode.apply(&mut host, &mut negative, &mut image).unwrap();
     }
 

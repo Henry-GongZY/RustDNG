@@ -8,8 +8,8 @@
 // PORT-NOTE(dng_exif.cpp ParseTag): the `#if qDNGValidate` dump blocks are
 // omitted; every functional branch is ported.
 
-use crate::dng_core::dng_exceptions::bad_format;
-use crate::dng_core::{
+use dng_core::dng_exceptions::bad_format;
+use dng_core::{
     check_color_image, check_tag_count, check_tag_type, dng_char4, parse_date_time_tag,
     parse_dual_string_tag, parse_encoded_string_tag, parse_string_tag, DngDateTime, DngDateTimeInfo,
     DngDateTimeStorageInfo, DngFingerprint, DngResult, DngSRational, DngShared, DngStream,
@@ -44,23 +44,23 @@ use crate::dng_core::{
     tcTimeZoneOffset, tcUserComment, tcWaterDepth, tcWhiteBalance, ttAscii, ttByte, ttLong,
     ttRational, ttShort, ttSRational, ttUndefined,
 };
-use crate::dng_core::dng_tags::tcInteroperabilityIndex;
-use crate::dng_core::dng_tags::tcInteroperabilityVersion;
-use crate::dng_core::dng_tags::tcRelatedImageFileFormat as _ri;
-use crate::dng_core::dng_types::{real64, uint8, uint16, uint32, uint64};
-use crate::dng_core::DngError;
+use dng_core::dng_tags::tcInteroperabilityIndex;
+use dng_core::dng_tags::tcInteroperabilityVersion;
+use dng_core::dng_tags::tcRelatedImageFileFormat as _ri;
+use dng_core::dng_types::{real64, uint8, uint16, uint32, uint64};
+use dng_core::DngError;
 
 /// Port of `dng_exif`.
 #[derive(Debug, Clone, Default)]
 pub struct DngExif {
-    pub image_description: crate::dng_core::DngString,
-    pub make: crate::dng_core::DngString,
-    pub model: crate::dng_core::DngString,
-    pub software: crate::dng_core::DngString,
-    pub artist: crate::dng_core::DngString,
-    pub copyright: crate::dng_core::DngString,
-    pub copyright2: crate::dng_core::DngString,
-    pub user_comment: crate::dng_core::DngString,
+    pub image_description: dng_core::DngString,
+    pub make: dng_core::DngString,
+    pub model: dng_core::DngString,
+    pub software: dng_core::DngString,
+    pub artist: dng_core::DngString,
+    pub copyright: dng_core::DngString,
+    pub copyright2: dng_core::DngString,
+    pub user_comment: dng_core::DngString,
 
     pub date_time: DngDateTimeInfo,
     pub date_time_storage_info: DngDateTimeStorageInfo,
@@ -86,7 +86,7 @@ pub struct DngExif {
     pub subject_distance: DngURational,
     pub gamma: DngURational,
     pub battery_level_r: DngURational,
-    pub battery_level_a: crate::dng_core::DngString,
+    pub battery_level_a: dng_core::DngString,
 
     pub exposure_program: uint32,
     pub metering_mode: uint32,
@@ -138,57 +138,57 @@ pub struct DngExif {
     pub image_unique_id: DngFingerprint,
 
     pub gps_version_id: uint32,
-    pub gps_latitude_ref: crate::dng_core::DngString,
+    pub gps_latitude_ref: dng_core::DngString,
     pub gps_latitude: [DngURational; 3],
-    pub gps_longitude_ref: crate::dng_core::DngString,
+    pub gps_longitude_ref: dng_core::DngString,
     pub gps_longitude: [DngURational; 3],
     pub gps_altitude_ref: uint32,
     pub gps_altitude: DngURational,
     pub gps_time_stamp: [DngURational; 3],
-    pub gps_satellites: crate::dng_core::DngString,
-    pub gps_status: crate::dng_core::DngString,
-    pub gps_measure_mode: crate::dng_core::DngString,
+    pub gps_satellites: dng_core::DngString,
+    pub gps_status: dng_core::DngString,
+    pub gps_measure_mode: dng_core::DngString,
     pub gps_dop: DngURational,
-    pub gps_speed_ref: crate::dng_core::DngString,
+    pub gps_speed_ref: dng_core::DngString,
     pub gps_speed: DngURational,
-    pub gps_track_ref: crate::dng_core::DngString,
+    pub gps_track_ref: dng_core::DngString,
     pub gps_track: DngURational,
-    pub gps_img_direction_ref: crate::dng_core::DngString,
+    pub gps_img_direction_ref: dng_core::DngString,
     pub gps_img_direction: DngURational,
-    pub gps_map_datum: crate::dng_core::DngString,
-    pub gps_dest_latitude_ref: crate::dng_core::DngString,
+    pub gps_map_datum: dng_core::DngString,
+    pub gps_dest_latitude_ref: dng_core::DngString,
     pub gps_dest_latitude: [DngURational; 3],
-    pub gps_dest_longitude_ref: crate::dng_core::DngString,
+    pub gps_dest_longitude_ref: dng_core::DngString,
     pub gps_dest_longitude: [DngURational; 3],
-    pub gps_dest_bearing_ref: crate::dng_core::DngString,
+    pub gps_dest_bearing_ref: dng_core::DngString,
     pub gps_dest_bearing: DngURational,
-    pub gps_dest_distance_ref: crate::dng_core::DngString,
+    pub gps_dest_distance_ref: dng_core::DngString,
     pub gps_dest_distance: DngURational,
-    pub gps_processing_method: crate::dng_core::DngString,
-    pub gps_area_information: crate::dng_core::DngString,
-    pub gps_date_stamp: crate::dng_core::DngString,
+    pub gps_processing_method: dng_core::DngString,
+    pub gps_area_information: dng_core::DngString,
+    pub gps_date_stamp: dng_core::DngString,
     pub gps_differential: uint32,
     pub gps_h_positioning_error: DngURational,
 
-    pub interoperability_index: crate::dng_core::DngString,
+    pub interoperability_index: dng_core::DngString,
     pub interoperability_version: uint32,
-    pub related_image_file_format: crate::dng_core::DngString,
+    pub related_image_file_format: dng_core::DngString,
     pub related_image_width: uint32,
     pub related_image_length: uint32,
 
-    pub camera_serial_number: crate::dng_core::DngString,
+    pub camera_serial_number: dng_core::DngString,
     pub lens_info: [DngURational; 4],
-    pub lens_id: crate::dng_core::DngString,
-    pub lens_make: crate::dng_core::DngString,
-    pub lens_name: crate::dng_core::DngString,
-    pub lens_serial_number: crate::dng_core::DngString,
+    pub lens_id: dng_core::DngString,
+    pub lens_make: dng_core::DngString,
+    pub lens_name: dng_core::DngString,
+    pub lens_serial_number: dng_core::DngString,
     pub lens_name_was_read_from_exif: bool,
 
     pub approx_focus_distance: DngURational,
     pub flash_compensation: DngSRational,
 
-    pub owner_name: crate::dng_core::DngString,
-    pub firmware: crate::dng_core::DngString,
+    pub owner_name: dng_core::DngString,
+    pub firmware: dng_core::DngString,
 
     pub temperature: DngSRational,
     pub humidity: DngURational,
@@ -197,19 +197,19 @@ pub struct DngExif {
     pub acceleration: DngURational,
     pub camera_elevation_angle: DngSRational,
 
-    pub title: crate::dng_core::DngString,
+    pub title: dng_core::DngString,
 
     pub lens_distort_info: [DngSRational; 4],
     pub neutral_density_factor: DngURational,
 
-    pub subsec_time: crate::dng_core::DngString,
-    pub subsec_time_original: crate::dng_core::DngString,
-    pub subsec_time_digitized: crate::dng_core::DngString,
+    pub subsec_time: dng_core::DngString,
+    pub subsec_time_original: dng_core::DngString,
+    pub subsec_time_digitized: dng_core::DngString,
 
     /// EXIF 2.3 offset-time strings ("+HH:MM").
-    pub offset_time: crate::dng_core::DngString,
-    pub offset_time_original: crate::dng_core::DngString,
-    pub offset_time_digitized: crate::dng_core::DngString,
+    pub offset_time: dng_core::DngString,
+    pub offset_time_original: dng_core::DngString,
+    pub offset_time_digitized: dng_core::DngString,
 }
 
 impl DngExif {
@@ -403,7 +403,7 @@ impl DngExif {
 
     /// `SetExposureTime (et, snap)`.
     pub fn set_exposure_time(&mut self, et: real64, snap: bool) {
-        use crate::dng_core::dng_rational::DngURational as UR;
+        use dng_core::dng_rational::DngURational as UR;
 
         self.exposure_time.clear();
         self.shutter_speed_value.clear();
@@ -420,7 +420,7 @@ impl DngExif {
                 self.exposure_time.set_real64(et, 10);
                 self.exposure_time.reduce_by_factor(10);
             } else if et <= 0.1 {
-                self.exposure_time = UR::new(1, crate::dng_core::dng_utils::round_uint32_f64(1.0 / et));
+                self.exposure_time = UR::new(1, dng_core::dng_utils::round_uint32_f64(1.0 / et));
             } else {
                 self.exposure_time.set_real64(et, 100);
                 self.exposure_time.reduce_by_factor(10);
@@ -546,7 +546,7 @@ impl DngExif {
     }
 
     /// `SetLensDistortInfo (params)`.
-    pub fn set_lens_distort_info(&mut self, params: &crate::dng_core::dng_matrix::DngVector) {
+    pub fn set_lens_distort_info(&mut self, params: &dng_core::dng_matrix::DngVector) {
         if params.count() != 4 {
             return;
         }
@@ -819,7 +819,7 @@ impl DngExif {
                 check_tag_count(parent_code, tag_code, tag_count, 1, 0);
                 // EXIF 2.3 TimeZoneOffset feeds the date_time zone.
                 let sr = stream.tag_value_srational(ttSRational)?;
-                let mut zone = crate::dng_core::dng_date_time::DngTimeZone::new();
+                let mut zone = dng_core::dng_date_time::DngTimeZone::new();
                 zone.set_offset_minutes(sr.as_real64().round() as i32 * 60);
                 if zone.is_valid() {
                     self.date_time.set_zone(zone);
@@ -852,7 +852,7 @@ impl DngExif {
                 self.date_time_original.set_date_time(dt);
                 self.date_time_original_storage_info = DngDateTimeStorageInfo::from_offset(
                     tag_position,
-                    crate::dng_core::dng_date_time::DngDateTimeFormat::Exif,
+                    dng_core::dng_date_time::DngDateTimeFormat::Exif,
                 );
             }
             x if x == tcDateTimeDigitized => {
@@ -860,7 +860,7 @@ impl DngExif {
 
                 self.date_time_digitized_storage_info = DngDateTimeStorageInfo::from_offset(
                     tag_position,
-                    crate::dng_core::dng_date_time::DngDateTimeFormat::Exif,
+                    dng_core::dng_date_time::DngDateTimeFormat::Exif,
                 );
 
                 let mut dt = DngDateTime::new();
@@ -1159,7 +1159,7 @@ impl DngExif {
             x if x == tcGPSLatitudeRef || x == tcGPSLongitudeRef => {
                 check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16]);
                 check_tag_count(parent_code, tag_code, tag_count, 2, 0);
-                let mut s = crate::dng_core::DngString::new();
+                let mut s = dng_core::DngString::new();
                 parse_string_tag(stream, parent_code, tag_code, tag_count, &mut s, false)?;
                 if tag_code == tcGPSLatitudeRef {
                     self.gps_latitude_ref = s;
@@ -1273,7 +1273,7 @@ impl DngExif {
             x if x == tcGPSDestLatitudeRef || x == tcGPSDestLongitudeRef => {
                 check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16]);
                 check_tag_count(parent_code, tag_code, tag_count, 2, 0);
-                let mut s = crate::dng_core::DngString::new();
+                let mut s = dng_core::DngString::new();
                 parse_string_tag(stream, parent_code, tag_code, tag_count, &mut s, false)?;
                 if tag_code == tcGPSDestLatitudeRef {
                     self.gps_dest_latitude_ref = s;
@@ -1378,7 +1378,7 @@ impl DngExif {
         _tag_offset: uint64,
     ) -> DngResult<bool> {
         match tag_code {
-            x if x == crate::dng_core::dng_tags::tcInteroperabilityIndex => {
+            x if x == dng_core::dng_tags::tcInteroperabilityIndex => {
                 check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16]);
                 parse_string_tag(
                     stream,
@@ -1389,7 +1389,7 @@ impl DngExif {
                     false,
                 )?;
             }
-            x if x == crate::dng_core::dng_tags::tcInteroperabilityVersion => {
+            x if x == dng_core::dng_tags::tcInteroperabilityVersion => {
                 check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16]);
                 check_tag_count(parent_code, tag_code, tag_count, 4, 0);
                 let b0 = stream.get_uint8()? as uint32;
@@ -1398,7 +1398,7 @@ impl DngExif {
                 let b3 = stream.get_uint8()? as uint32;
                 self.interoperability_version = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
             }
-            x if x == crate::dng_core::dng_tags::tcRelatedImageFileFormat => {
+            x if x == dng_core::dng_tags::tcRelatedImageFileFormat => {
                 check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16]);
                 parse_string_tag(
                     stream,
@@ -1409,12 +1409,12 @@ impl DngExif {
                     true,
                 )?;
             }
-            x if x == crate::dng_core::dng_tags::tcRelatedImageWidth => {
+            x if x == dng_core::dng_tags::tcRelatedImageWidth => {
                 check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
                 check_tag_count(parent_code, tag_code, tag_count, 1, 0);
                 self.related_image_width = stream.tag_value_uint32(tag_type)?;
             }
-            x if x == crate::dng_core::dng_tags::tcRelatedImageLength => {
+            x if x == dng_core::dng_tags::tcRelatedImageLength => {
                 check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16, ttLong as uint16]);
                 check_tag_count(parent_code, tag_code, tag_count, 1, 0);
                 self.related_image_length = stream.tag_value_uint32(tag_type)?;
@@ -1498,7 +1498,7 @@ impl DngExif {
                     check_tag_type(parent_code, tag_code, tag_type, &[ttShort as uint16]);
                     // Kodak packs 6 shorts of BCD digits.
                     check_tag_count(parent_code, tag_code, tag_count, 6, 0);
-                    let mut s = crate::dng_core::DngString::new();
+                    let mut s = dng_core::DngString::new();
                     let mut text: Vec<u8> = Vec::with_capacity(12);
                     for _ in 0..6 {
                         let x = stream.get_uint16()?;
@@ -1528,7 +1528,7 @@ impl DngExif {
                     return Ok(false);
                 }
 
-                let mut s = crate::dng_core::DngString::new();
+                let mut s = dng_core::DngString::new();
                 parse_string_tag(stream, parent_code, tag_code, tag_count, &mut s, false)?;
 
                 if s.length() != 32 {
@@ -1537,7 +1537,7 @@ impl DngExif {
 
                 let mut fp = DngFingerprint::new();
                 for j in 0..32usize {
-                    let c = crate::dng_core::dng_utils::force_uppercase(s.get()[j]);
+                    let c = dng_core::dng_utils::force_uppercase(s.get()[j]);
 
                     let digit: Option<u32> = match c {
                         b'0'..=b'9' => Some((c - b'0') as u32),
@@ -1560,7 +1560,7 @@ impl DngExif {
 
                 self.date_time_storage_info = DngDateTimeStorageInfo::from_offset(
                     tag_position,
-                    crate::dng_core::dng_date_time::DngDateTimeFormat::Exif,
+                    dng_core::dng_date_time::DngDateTimeFormat::Exif,
                 );
 
                 let mut dt = DngDateTime::new();
@@ -1657,7 +1657,7 @@ mod tests {
     fn lens_distort_info() {
         let mut e = DngExif::new();
         assert!(!e.has_lens_distort_info());
-        let params = crate::dng_core::dng_matrix::DngVector::from_values(&[
+        let params = dng_core::dng_matrix::DngVector::from_values(&[
             0.001, -0.002, 0.003, -0.004,
         ])
         .unwrap();
@@ -1671,7 +1671,7 @@ mod tests {
     fn parse_exposure_time_tag() {
         let mut e = DngExif::new();
         let mut shared = DngShared::new();
-        let mut stream = crate::dng_core::dng_memory_stream::DngMemoryStream::new().stream();
+        let mut stream = dng_core::dng_memory_stream::DngMemoryStream::new().stream();
         stream.set_big_endian(true);
         stream.put_uint32(1).unwrap();
         stream.put_uint32(125).unwrap();
@@ -1697,7 +1697,7 @@ mod tests {
     fn parse_gps_tags() {
         let mut e = DngExif::new();
         let mut shared = DngShared::new();
-        let mut stream = crate::dng_core::dng_memory_stream::DngMemoryStream::new().stream();
+        let mut stream = dng_core::dng_memory_stream::DngMemoryStream::new().stream();
 
         // GPSLatitudeRef "N\0".
         stream.put(b"N\0").unwrap();
@@ -1708,7 +1708,7 @@ mod tests {
         assert_eq!(e.gps_latitude_ref.get(), b"N");
 
         // GPSLatitude 3 rationals.
-        let mut stream = crate::dng_core::dng_memory_stream::DngMemoryStream::new().stream();
+        let mut stream = dng_core::dng_memory_stream::DngMemoryStream::new().stream();
         for _ in 0..3 {
             stream.put_uint32(37).unwrap();
             stream.put_uint32(1).unwrap();
@@ -1724,7 +1724,7 @@ mod tests {
     fn unhandled_tag_returns_false() {
         let mut e = DngExif::new();
         let mut shared = DngShared::new();
-        let mut stream = crate::dng_core::dng_memory_stream::DngMemoryStream::new().stream();
+        let mut stream = dng_core::dng_memory_stream::DngMemoryStream::new().stream();
         assert!(!e
             .parse_tag(&mut stream, &mut shared, 0, false, 0xDEAD, ttLong, 1, 0)
             .unwrap());

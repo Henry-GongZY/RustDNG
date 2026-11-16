@@ -689,18 +689,18 @@ impl DngTiffDirectory {
     }
 
     /// `Add (tag)` — tags must be added in sorted-by-code order (as in the
-    /// C++ writer contract; `Put` asserts order like the SDK's debug build).
+    /// C++ writer contract: `dng_tiff_directory::Add` inserts the tag in
+    /// sorted position ("Tags must be sorted in increasing order of tag
+    /// code" — inserted before the first larger code), so callers may add
+    /// tags in any order.
     pub fn add(&mut self, tag: Box<dyn TiffTag>) {
-        #[cfg(debug_assertions)]
-        if let Some(last) = self.tags.last() {
-            debug_assert!(
-                tag.code() > last.code(),
-                "TIFF tags added out of order (code {} after {})",
-                tag.code(),
-                last.code()
-            );
-        }
-        self.tags.push(tag);
+        let insert_index = self
+            .tags
+            .iter()
+            .position(|existing| tag.code() < existing.code())
+            .unwrap_or(self.tags.len());
+
+        self.tags.insert(insert_index, tag);
     }
 
     /// `SetChained (offset)`.

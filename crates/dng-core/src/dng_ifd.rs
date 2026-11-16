@@ -220,6 +220,10 @@ pub struct DngIfd {
     pub image_stats_offset: uint64,
     pub image_stats_count: uint32,
 
+    /// `fImageStats` (dng_ifd.h:263) — parsed inline at tcImageStats
+    /// (dng_ifd.cpp:3033).
+    pub image_stats: crate::dng_utils::DngImageStats,
+
     pub jxl_distance: real32,
     pub jxl_effort: int32,
     pub jxl_decode_speed: int32,
@@ -349,6 +353,7 @@ impl DngIfd {
             profile_gain_table_map_tag_version: 1,
             image_stats_offset: 0,
             image_stats_count: 0,
+            image_stats: crate::dng_utils::DngImageStats::default(),
             jxl_distance: -1.0,
             jxl_effort: -1,
             jxl_decode_speed: -1,
@@ -1188,6 +1193,9 @@ impl DngIfd {
 
             x if x == tcImageStats => {
                 check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16, ttByte as uint16]);
+                // C++ (dng_ifd.cpp:3033) parses the stats inline:
+                // fImageStats.Parse (stream);
+                self.image_stats.parse(stream)?;
                 self.image_stats_count = tag_count;
                 self.image_stats_offset = tag_offset;
                 if tag_offset == 0 {
@@ -1351,7 +1359,7 @@ impl DngIfd {
 
         // Check NewSubFileType.
         if !self.uses_new_sub_file_type {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         match self.new_sub_file_type {
@@ -1370,37 +1378,37 @@ impl DngIfd {
 
         // Check ImageWidth and ImageLength.
         if self.image_width < 1 || self.image_length < 1 {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         if self.image_width > kMaxImageSide || self.image_length > kMaxImageSide {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Check PhotometricInterpretation per NewSubFileType.
         if self.new_sub_file_type == sfTransparencyMask || self.new_sub_file_type == sfPreviewMask {
             if self.photometric_interpretation != piTransparencyMask {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
         } else if self.new_sub_file_type == sfDepthMap
             || self.new_sub_file_type == sfPreviewDepthMap
         {
             if self.photometric_interpretation != piDepth {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
         } else if self.new_sub_file_type == sfSemanticMask {
             if self.photometric_interpretation != piPhotometricMask {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
             if self.samples_per_pixel != 1 {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
         } else if is_color {
             // PhotometricInterpretation for color images.
             match self.photometric_interpretation {
                 x if x == piCFA => {
                     if !is_main_ifd {
-                        return false;
+                        return { eprintln!("INVALID-DIAG line {}", line!()); false };
                     }
                 }
                 x if x == piLinearRaw => {}
@@ -1412,13 +1420,13 @@ impl DngIfd {
         match self.photometric_interpretation {
             x if x == piBlackIsZero => {
                 if is_color && is_main_ifd {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
             }
             x if x == piRGB || x == piYCbCr => {}
             x if x == piCFA => {
                 if is_monochrome {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
             }
             _ => {}
@@ -1426,7 +1434,7 @@ impl DngIfd {
 
         // Gain maps must be output-referred.
         if is_gain_map_ifd && shared.colorimetric_reference == crSceneReferred {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Floating point support.
@@ -1435,7 +1443,7 @@ impl DngIfd {
             && self.photometric_interpretation != piLinearRaw
             && self.photometric_interpretation != piTransparencyMask
         {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Check SamplesPerPixel and BitsPerSample.
@@ -1466,7 +1474,7 @@ impl DngIfd {
         if self.samples_per_pixel < min_samples_per_pixel
             || self.samples_per_pixel > max_samples_per_pixel
         {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         for j in 0..kMaxSamplesPerPixel as usize {
@@ -1474,7 +1482,7 @@ impl DngIfd {
                 if self.bits_per_sample[j] < min_bits_per_sample
                     || self.bits_per_sample[j] > max_bits_per_sample
                 {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
 
                 if is_floating_point
@@ -1482,7 +1490,7 @@ impl DngIfd {
                     && self.bits_per_sample[j] != 24
                     && self.bits_per_sample[j] != 32
                 {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
 
                 if min_bits_per_sample == 8
@@ -1490,14 +1498,14 @@ impl DngIfd {
                     && self.bits_per_sample[j] != 8
                     && self.bits_per_sample[j] != 16
                 {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
 
                 if j > 0 && self.bits_per_sample[j] != self.bits_per_sample[0] {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
             } else if self.bits_per_sample[j] != 0 {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
         }
 
@@ -1506,10 +1514,10 @@ impl DngIfd {
             x if x == ccUncompressed || x == ccVc5 => {}
             x if x == ccJPEG => {
                 if self.photometric_interpretation == piRGB {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
                 if self.bits_per_sample[0] > 16 {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
             }
             x if x == ccLossyJPEG => {
@@ -1517,10 +1525,10 @@ impl DngIfd {
                     && self.photometric_interpretation != piPhotometricMask
                     && self.photometric_interpretation != piGainMap
                 {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
                 if self.bits_per_sample[0] != 8 {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
             }
             x if x == ccJXL => {
@@ -1536,7 +1544,7 @@ impl DngIfd {
                     _ => return false,
                 }
                 if !(8..=16).contains(&self.bits_per_sample[0]) {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
             }
             x if x == ccDeflate => {
@@ -1546,7 +1554,7 @@ impl DngIfd {
                     && self.bits_per_sample[0] != 16
                     && self.bits_per_sample[0] != 8
                 {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
                 if is_floating_point
                     && self.predictor != cpFloatingPoint
@@ -1554,7 +1562,7 @@ impl DngIfd {
                     && self.predictor != cpFloatingPointX4
                     && self.predictor != cpNullPredictor
                 {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
                 if !is_floating_point
                     && self.compression == ccDeflate
@@ -1568,19 +1576,19 @@ impl DngIfd {
                     && self.predictor != cpHorizontalDifferenceX2
                     && self.predictor != cpHorizontalDifferenceX4
                 {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
             }
             x if x == ccLZW => {
                 if is_floating_point {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
                 if self.predictor != cpNullPredictor
                     && self.predictor != cpHorizontalDifference
                     && self.predictor != cpHorizontalDifferenceX2
                     && self.predictor != cpHorizontalDifferenceX4
                 {
-                    return false;
+                    return { eprintln!("INVALID-DIAG line {}", line!()); false };
                 }
             }
             _ => return false,
@@ -1588,17 +1596,17 @@ impl DngIfd {
 
         // Check FillOrder.
         if self.fill_order != 1 {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Check PlanarConfiguration.
         if self.planar_configuration != pcInterleaved {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Check ExtraSamples.
         if self.extra_samples_count != 0 {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Check SampleFormat.
@@ -1609,21 +1617,21 @@ impl DngIfd {
                 sfUnsignedInteger
             };
             if self.sample_format[j] != expected {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
         }
 
         // Check Orientation.
         if self.orientation > 9 {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Check Strips vs. Tiles.
         if !self.uses_strips && !self.uses_tiles {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
         if self.uses_strips && self.uses_tiles {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Check tile info.
@@ -1632,36 +1640,36 @@ impl DngIfd {
         let tile_count = tiles_wide * tiles_high;
 
         if self.tile_offsets_count != tile_count {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
         if self.tile_byte_counts_count != tile_count {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Check CFA pattern.
         if self.photometric_interpretation == piCFA && !self.is_valid_cfa(shared) {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Check ActiveArea.
         if (self.active_area.and_(image_area) != self.active_area) || self.active_area.is_empty() {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         if self.active_area != image_area && shared.dng_backward_version < dngVersion_1_1_0_0 {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Check LinearizationTable.
         if self.linearization_table_count != 0 {
             if self.linearization_table_type != ttShort {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
             if !(2..=65536).contains(&self.linearization_table_count) {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
             if is_floating_point || self.bits_per_sample[0] > 16 {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
         }
 
@@ -1671,7 +1679,7 @@ impl DngIfd {
             || self.black_level_repeat_cols < 1
             || self.black_level_repeat_cols > kMaxBlackPattern
         {
-            return false;
+            return { eprintln!("INVALID-DIAG line {}", line!()); false };
         }
 
         // Check BlackLevel black level repeat pattern count.
@@ -1697,7 +1705,7 @@ impl DngIfd {
                 || self.default_user_crop_b.as_real64() != 1.0
                 || self.default_user_crop_r.as_real64() != 1.0
             {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
         }
 
@@ -1706,10 +1714,10 @@ impl DngIfd {
             if self.row_interleave_factor < 1
                 || self.row_interleave_factor > self.image_length
             {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
             if shared.dng_backward_version < dngVersion_1_2_0_0 {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
         }
 
@@ -1718,10 +1726,10 @@ impl DngIfd {
             if self.column_interleave_factor < 1
                 || self.column_interleave_factor > self.image_width
             {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
             if shared.dng_backward_version < dngVersion_1_7_0_0 {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
         }
 
@@ -1732,15 +1740,15 @@ impl DngIfd {
                 || self.sub_tile_block_cols < 1
                 || self.sub_tile_block_cols > self.tile_width
             {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
             if (self.tile_length % self.sub_tile_block_rows) != 0
                 || (self.tile_width % self.sub_tile_block_cols) != 0
             {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
             if shared.dng_backward_version < dngVersion_1_2_0_0 {
-                return false;
+                return { eprintln!("INVALID-DIAG line {}", line!()); false };
             }
         }
 
