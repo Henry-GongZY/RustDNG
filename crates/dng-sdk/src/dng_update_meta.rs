@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_update_meta.cpp/.h`.
+//
+// Copyright 2021 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 //! Port of `dng_update_meta.cpp` / `dng_update_meta.h` — the "update metadata
 //! in place" machinery (`DNGUpdateMetadata`, `CleanUpMetadataForUpdate`,
 //! `dng_file_updater`, `dng_ifd_updater`, `dng_tag_updater`), plus the

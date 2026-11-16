@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_utils.cpp/.h`.
+//
+// Copyright 2006-2023 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 // Port of dng_utils.h/.cpp — general purpose utilities: min/max/pin helpers,
 // rounding, byte swapping, half/FP24 float conversions, HSV conversions,
 // timers, dither noise, histogram/limit-float-depth image helpers and the

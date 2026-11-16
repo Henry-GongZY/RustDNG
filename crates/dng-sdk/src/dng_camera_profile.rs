@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_camera_profile.cpp/.h`.
+//
+// Copyright 2006-2023 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 // Port of dng_camera_profile.h/.cpp — camera color profiles.
 //
 // Phase-1's dng-core::DngCameraProfileInfo covers the wire format

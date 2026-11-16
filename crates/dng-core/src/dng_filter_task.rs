@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_filter_task.cpp/.h`.
+//
+// Copyright 2006-2019 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 // Port of dng_filter_task.h/.cpp — the filter-task base lives in
 // dng_area_task.rs (`DngFilterTaskBase`, since Rust has no multiple
 // inheritance); this module re-exports it under the C++ module name and

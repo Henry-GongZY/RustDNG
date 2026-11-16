@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_preview.cpp/.h`.
+//
+// Copyright 2007-2022 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 //! Port of `dng_preview.cpp` / `dng_preview.h` — `dng_preview`,
 //! `dng_preview_info` (in dng-core's `dng_ifd`), `dng_image_preview`,
 //! `dng_jpeg_preview`, `dng_jxl_preview`, `dng_raw_preview`,

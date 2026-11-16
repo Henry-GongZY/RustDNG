@@ -1,0 +1,49 @@
+# RustDNG — Licensing
+
+RustDNG is a Rust translation (a derivative work) of the **Adobe DNG SDK 1.7.1**.
+Because the translation is derived from Adobe's source code, the entire
+`dng-core`, `dng-sdk`, `dng-jpeg`, `dng-jxl`, `dng-xmp` and `dng-validate`
+code in this repository is distributed under the
+**Adobe DNG SDK License Agreement** — see [LICENSE-ADOBE-DNG-SDK.txt](LICENSE-ADOBE-DNG-SDK.txt)
+(the same agreement that accompanies the official Adobe DNG SDK distribution).
+
+## What that means for you
+
+- You may use, modify, redistribute and sublicense RustDNG **for any purpose**
+  (including commercial use), under the same agreement — §1 of the Adobe DNG
+  SDK License Agreement grants this explicitly.
+- You must keep the Adobe copyright notices in the source files
+  (they are embedded in the header of every `.rs` file) and pass the license
+  text along with the source (§2).
+- The software is provided **"AS IS"** with no warranty and limited liability
+  (§3–§4). If you distribute it inside a **commercial product**, §5 asks you
+  to indemnify Adobe for claims arising out of that distribution.
+- Do not use the Adobe name or the DNG logo to endorse or promote your product
+  (§6). RustDNG is not affiliated with or endorsed by Adobe; "DNG" and "Adobe"
+  are trademarks of Adobe Systems Incorporated.
+
+## Scope of the two license files
+
+| Content | License |
+|---|---|
+| Rust port in `crates/` (translation of Adobe DNG SDK 1.7.1) | Adobe DNG SDK License Agreement |
+| `vendor/` (the original C++ SDK) | Adobe DNG SDK License Agreement — **not included in this repository**; obtain it from Adobe's [DNG page](https://helpx.adobe.com/camera-raw/desktop/dng-and-file-formats/digital-negative.html) |
+| Third-party Rust crates (`half`, `flate2`/`miniz_oxide`, `crc32fast`, `quick-xml`, `jpeg-encoder`, `zune-jpeg`, `jxl-oxide`) | MIT and/or Apache-2.0 (and Zlib / IJG where noted) — each under its own upstream license, none of their code is redistributed here |
+| Documentation in this repo (`README.md`, `ARCHITECTURE.md`, `PORTING_NOTES.md`, …) | Same Adobe agreement as the port (written specifically about it) |
+
+## Patent note
+
+The Adobe DNG SDK License Agreement is a **copyright** license only. Adobe
+offers a separate (patent) license for implementing the DNG file format
+itself through the DNG Specification license — see
+<https://helpx.adobe.com/camera-raw/desktop/dng-and-file-formats/digital-negative.html>.
+
+## Why the whole repo is not MIT
+
+An earlier draft of this README claimed an MIT license for the Rust code.
+That was incorrect: translating the Adobe SDK source into Rust creates a
+derivative work of Adobe's source, so Adobe's license — not MIT — governs
+its distribution. The Adobe agreement is permissive (§1 allows derivative
+works and sublicensing for any purpose), but it is not an OSI-approved
+open-source license; treat this repository as **source-available under the
+Adobe DNG SDK License Agreement**.

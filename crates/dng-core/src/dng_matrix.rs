@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_matrix.cpp/.h`.
+//
+// Copyright 2006-2019 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 // Port of dng_matrix.h/.cpp — matrices (up to 4x4), vectors (up to 4),
 // products, transpose, inverse (2x2/3x3 closed form + N-by-N Gauss-Jordan)
 // and the pseudo-inverse with optional hint matrix.

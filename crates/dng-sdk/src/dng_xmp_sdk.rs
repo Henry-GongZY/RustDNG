@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_xmp_sdk.cpp/.h`.
+//
+// Copyright 2006-2019 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 // Port of dng_xmp_sdk.h/.cpp — facade over the XMP toolkit.
 //
 // The C++ wraps `SXMPMeta` from the Adobe XMP Toolkit; the Rust port wraps

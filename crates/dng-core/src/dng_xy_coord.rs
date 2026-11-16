@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_xy_coord.cpp/.h`.
+//
+// Copyright 2006-2019 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 // Port of dng_xy_coord.h/.cpp — xy/XYZ chromaticity conversions, standard
 // illuminant white points, illuminant data (xy or spectral) and the triple
 // illuminant weighting used by DNG 1.6+ dual/triple-illuminant profiles.

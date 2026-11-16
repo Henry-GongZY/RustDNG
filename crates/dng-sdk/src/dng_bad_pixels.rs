@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_bad_pixels.cpp/.h`.
+//
+// Copyright 2008-2019 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 //! Port of `dng_bad_pixels.cpp` / `dng_bad_pixels.h` — opcodes to fix
 //! defective pixels: `dng_opcode_FixBadPixelsConstant` (opcode 4) and
 //! `dng_opcode_FixBadPixelsList` (opcode 5) plus `dng_bad_pixel_list`.

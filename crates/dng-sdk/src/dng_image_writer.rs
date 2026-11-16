@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_image_writer.cpp/.h`.
+//
+// Copyright 2006-2022 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 //! Port of `dng_image_writer.cpp` / `dng_image_writer.h` — the DNG/TIFF
 //! writer (`dng_image_writer`, `dng_basic_tag_set`, and the WriteDNG
 //! pipeline).

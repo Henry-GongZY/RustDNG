@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_big_table.cpp/.h`.
+//
+// Copyright 2015-2023 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 //! Port of `dng_big_table.cpp` / `dng_big_table.h` — the "big table"
 //! infrastructure: the abstract `dng_big_table` base (fingerprinting,
 //! zlib-compressed binary codec, Z85-like ASCII codec for XMP),

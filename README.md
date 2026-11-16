@@ -33,6 +33,18 @@ cargo run -p dng-validate -- <file.dng>
 
 ## License / attribution
 
-- Adobe DNG SDK source (read-only reference, `vendor/`): Adobe DNG SDK License Agreement.
-- Pure-Rust dependencies: `half`, `flate2`/`miniz_oxide`, `crc32fast`, `quick-xml`, `jpeg-encoder`, `zune-jpeg`, `jxl-oxide` (all pure Rust; MIT/Apache-2.0).
-- Everything written in this repo: fresh Rust implementation, MIT.
+- **RustDNG itself** is a Rust translation (derivative work) of the Adobe DNG SDK
+  and is distributed under the **Adobe DNG SDK License Agreement**
+  ([LICENSE](LICENSE), [LICENSE-ADOBE-DNG-SDK.txt](LICENSE-ADOBE-DNG-SDK.txt)).
+  Every ported `.rs` file carries the Adobe copyright notice in its header, as
+  required by §2 of the agreement. Use/modify/redistribute/sublicense for any
+  purpose is granted by §1; the software is "AS IS" (§3–4); commercial
+  distribution triggers the indemnification clause (§5).
+- The original C++ SDK (`vendor/`, **not included in this repository**) and the
+  DNG Specification PDF remain under the same Adobe agreement — download them
+  from Adobe's [DNG page](https://helpx.adobe.com/camera-raw/desktop/dng-and-file-formats/digital-negative.html).
+- Pure-Rust dependencies: `half`, `flate2`/`miniz_oxide`, `crc32fast`,
+  `quick-xml`, `jpeg-encoder`, `zune-jpeg`, `jxl-oxide` — each under its own
+  permissive upstream license (MIT and/or Apache-2.0; see [NOTICE.md](NOTICE.md)).
+- **Trademark disclaimer**: RustDNG is not affiliated with or endorsed by Adobe.
+  "Adobe" and "DNG" are trademarks of Adobe Systems Incorporated.

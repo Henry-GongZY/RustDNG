@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1.
+//
+// Copyright 2005-2023 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 //! RDF/XML serialization following the XMP specification:
 //! - Part 2: "normal form" (one `rdf:Description` per schema, element-form
 //!   properties) and "compact form" (single `rdf:Description`, simple

@@ -1,3 +1,13 @@
+// This file is part of RustDNG, a Rust translation (with modifications) of
+// the Adobe DNG SDK 1.7.1 — derived from `dng_hue_sat_map.cpp/.h`.
+//
+// Copyright 2007-2019 Adobe Systems Incorporated. All Rights Reserved.
+// Rust translation and modifications: Copyright 2026 RustDNG contributors.
+//
+// NOTICE: Adobe permits you to use, modify, and distribute this file in
+// accordance with the terms of the Adobe DNG SDK License Agreement
+// accompanying this distribution (see LICENSE-ADOBE-DNG-SDK.txt).
+//
 // Port of dng_hue_sat_map.h/.cpp — hue/saturation/value lookup tables.
 //
 // `dng_ref_counted_block` maps to `Arc<Vec<HSBModify>>` (ARCHITECTURE.md §8);
