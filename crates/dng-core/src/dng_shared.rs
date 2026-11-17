@@ -1065,6 +1065,28 @@ impl DngShared {
                 self.has_shadow_scale = true;
             }
 
+            x if x == tcExifIFD || x == tcGPSInfo || x == tcInteroperabilityIFD => {
+                if !check_tag_type(
+                    parent_code,
+                    tag_code,
+                    tag_type,
+                    &[ttLong as uint16, ttLong8 as uint16],
+                ) {
+                    return Ok(false);
+                }
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+
+                let value = stream.tag_value_uint64(tag_type)?;
+
+                match tag_code {
+                    tcExifIFD => self.exif_ifd = value,
+                    tcGPSInfo => self.gps_info = value,
+                    _ => self.interoperability_ifd = value,
+                }
+            }
+
             x if x == tcDNGPrivateData => {
                 self.dng_private_data_count = tag_count;
                 self.dng_private_data_offset = tag_offset;

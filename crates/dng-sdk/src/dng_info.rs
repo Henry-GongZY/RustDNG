@@ -260,6 +260,9 @@ impl DngInfo {
             // Some TIFF file writers forget about the next IFD offset, so
             // validate the IFD at that offset before parsing it.
 
+            #[cfg(test)]
+            eprintln!("CHAIN-DIAG next_offset={} len={} ok={}", next_offset, stream.length(),
+                self.validate_ifd(stream, self.tiff_block_offset + next_offset, self.tiff_block_offset as int64)?);
             if !self.validate_ifd(
                 stream,
                 self.tiff_block_offset + next_offset,
@@ -506,7 +509,15 @@ impl DngInfo {
 
         let is_sub_ifd = parent_code >= tcFirstSubIFD && parent_code <= tcLastSubIFD;
 
+        let is_chained_ifd = parent_code >= tcFirstChainedIFD && parent_code <= tcLastChainedIFD;
+
         let mut ifd_index: Option<usize> = None;
+
+        // Chained-IFD index (parent codes tcFirstChainedIFD.., the C++ passes
+        // the owning dng_ifd pointer into ParseIFD; the port routes by parent
+        // code).
+
+        let mut chained_index: Option<usize> = None;
 
         if parent_code == 0 || is_sub_ifd {
             // The C++ routes to the IFD pointer passed in; the port finds the
@@ -520,6 +531,12 @@ impl DngInfo {
                 if index < self.ifd.len() {
                     ifd_index = Some(index);
                 }
+            }
+        } else if is_chained_ifd {
+            let index = (parent_code - tcFirstChainedIFD) as usize;
+
+            if index < self.chained_ifd.len() {
+                chained_index = Some(index);
             }
         }
 
@@ -555,6 +572,16 @@ impl DngInfo {
 
                 let accepted =
                     self.ifd[index].parse_tag(host, stream, parent_code, tag_code, tag_type, tag_count, tag_offset)?;
+
+                if accepted {
+                    return Ok(());
+                }
+            } else if let Some(index) = chained_index {
+                stream.set_read_position(tag_offset)?;
+
+                let accepted = self.chained_ifd[index].parse_tag(
+                    host, stream, parent_code, tag_code, tag_type, tag_count, tag_offset,
+                )?;
 
                 if accepted {
                     return Ok(());
@@ -912,7 +939,9 @@ impl DngInfo {
                 self.parse_tag(
                     host,
                     &mut ifd_stream,
-                    ifd_index.is_some(),
+                    ifd_index.is_some()
+                        || (parent_code >= tcFirstChainedIFD
+                            && parent_code <= tcLastChainedIFD),
                     with_exif,
                     parent_code,
                     tag_code,
@@ -2400,6 +2429,7 @@ mod tests {
     // Synthetic minimal-DNG byte layout builder (little-endian TIFF).
     // ------------------------------------------------------------------
 
+    #[derive(Clone)]
     struct IfdEntry {
         tag: uint16,
         tag_type: uint16,
@@ -2409,6 +2439,7 @@ mod tests {
         payload: Vec<u8>,
     }
 
+    #[derive(Clone)]
     struct Ifd {
         entries: Vec<IfdEntry>,
         /// Offset of the next IFD (0 = none).
@@ -2658,6 +2689,453 @@ mod tests {
     }
 
     #[test]
+    /// Feature-rich synthetic DNG: chained thumbnail IFD, Exif IFD,
+    /// ExtraCameraProfiles pointing at an extended profile block, and an
+    /// "Adobe" DNGPrivateData prefix. Exercises the real-camera paths.
+    #[test]
+    fn feature_rich_dng_parse() {
+        use dng_core::dng_tags::*;
+        use dng_core::dng_tag_types::*;
+
+        let rational_bytes = |n: u32, d: u32| -> Vec<u8> {
+            let mut v = n.to_le_bytes().to_vec();
+            v.extend_from_slice(&d.to_le_bytes());
+            v
+        };
+
+        // -- Extended profile block (mini TIFF, big endian) --------------
+
+        let mut block: Vec<u8> = Vec::new();
+        block.extend_from_slice(&[0x4D, 0x4D, 0x43, 0x52]); // 'MM' + 'CR'
+        let block_offset_pos = block.len();
+        block.extend_from_slice(&[0, 0, 0, 0]); // patched: IFD at block+8
+        block.extend_from_slice(&[0, 5]); // 5 entries
+
+        let mut block_entries: Vec<(u16, u16, u32, Vec<u8>)> = Vec::new();
+        let mut block_data: Vec<u8> = Vec::new();
+
+        let mut push_be = |entries: &mut Vec<(u16, u16, u32, Vec<u8>)>,
+                           data: &mut Vec<u8>,
+                           base: u32,
+                           tag: u16,
+                           ty: u16,
+                           count: u32,
+                           payload: Vec<u8>| {
+            let size = match ty {
+                t if t == ttAscii as u16 || t == ttByte as u16 || t == ttUndefined as u16 => 1,
+                t if t == ttShort as u16 => 2,
+                t if t == ttLong as u16 => 4,
+                t if t == ttSRational as u16 || t == ttDouble as u16 => 8,
+                t if t == ttFloat as u16 => 4,
+                _ => panic!("bad type"),
+            };
+            let total = size * count as usize;
+            if total <= 4 {
+                let mut v = payload.clone();
+                v.resize(4, 0);
+                entries.push((tag, ty, count, v));
+            } else {
+                while data.len() % 4 != 0 {
+                    data.push(0);
+                }
+                let off = base + data.len() as u32;
+                entries.push((tag, ty, count, off.to_be_bytes().to_vec()));
+                data.extend_from_slice(&payload[..total]);
+            }
+        };
+
+        // base = 8 + 2 + 5*12 = 70.
+        let block_base = 8 + 2 + 5 * 12;
+
+        // ProfileName "Extra".
+        push_be(
+            &mut block_entries,
+            &mut block_data,
+            block_base,
+            tcProfileName as u16,
+            ttAscii as u16,
+            5,
+            b"Extra".to_vec(),
+        );
+        // ColorMatrix1 3x3 identity.
+        {
+            let mut v = Vec::new();
+            for i in 0..9 {
+                let (n, d) = if i == 0 || i == 4 || i == 8 {
+                    (10000i32, 10000i32)
+                } else {
+                    (0, 1)
+                };
+                v.extend_from_slice(&n.to_be_bytes());
+                v.extend_from_slice(&d.to_be_bytes());
+            }
+            push_be(
+                &mut block_entries,
+                &mut block_data,
+                block_base,
+                tcColorMatrix1 as u16,
+                ttSRational as u16,
+                9,
+                v,
+            );
+        }
+        // HueSatMapDims 2/3/1.
+        push_be(
+            &mut block_entries,
+            &mut block_data,
+            block_base,
+            tcProfileHueSatMapDims as u16,
+            ttLong as u16,
+            3,
+            {
+                let mut v = Vec::new();
+                for x in [2u32, 3, 1] {
+                    v.extend_from_slice(&x.to_be_bytes());
+                }
+                v
+            },
+        );
+        // HueSatMapData1: 18 floats, value i * 0.25.
+        push_be(
+            &mut block_entries,
+            &mut block_data,
+            block_base,
+            tcProfileHueSatMapData1 as u16,
+            ttFloat as u16,
+            18,
+            {
+                let mut v = Vec::new();
+                for i in 0..18u32 {
+                    v.extend_from_slice(&(i as f32 * 0.25).to_be_bytes());
+                }
+                v
+            },
+        );
+        // BaselineExposureOffset 1/3.
+        push_be(
+            &mut block_entries,
+            &mut block_data,
+            block_base,
+            tcBaselineExposureOffset as u16,
+            ttSRational as u16,
+            1,
+            {
+                let mut v = Vec::new();
+                v.extend_from_slice(&1i32.to_be_bytes());
+                v.extend_from_slice(&3i32.to_be_bytes());
+                v
+            },
+        );
+
+        // Serialize entries.
+        for (tag, ty, count, value) in &block_entries {
+            block.extend_from_slice(&tag.to_be_bytes());
+            block.extend_from_slice(&ty.to_be_bytes());
+            block.extend_from_slice(&count.to_be_bytes());
+            block.extend_from_slice(value);
+        }
+        // Patch the IFD offset (block+8).
+        block[block_offset_pos..block_offset_pos + 4].copy_from_slice(&(8u32).to_be_bytes());
+        block.extend_from_slice(&block_data);
+
+        // -- Main TIFF ----------------------------------------------------
+
+        let extended_block_offset_placeholder = 0u32; // patched below
+
+        let cfa_entries = vec![
+            entry(
+                tcNewSubFileType as uint16,
+                ttLong as uint16,
+                1,
+                u32v(&[sfMainImage]),
+            ),
+            entry(tcImageWidth as uint16, ttLong as uint16, 1, u32v(&[4])),
+            entry(tcImageLength as uint16, ttLong as uint16, 1, u32v(&[4])),
+            entry(tcBitsPerSample as uint16, ttShort as uint16, 1, u16v(&[16])),
+            entry(tcCompression as uint16, ttShort as uint16, 1, u16v(&[1])),
+            entry(
+                tcPhotometricInterpretation as uint16,
+                ttShort as uint16,
+                1,
+                u16v(&[32803]), // piCFA
+            ),
+            entry(
+                dng_core::dng_tags::tcCFARepeatPatternDim as uint16,
+                ttShort as uint16,
+                2,
+                u16v(&[2, 2]),
+            ),
+            entry(
+                dng_core::dng_tags::tcCFAPattern as uint16,
+                ttByte as uint16,
+                4,
+                vec![0, 1, 1, 2],
+            ),
+            entry(
+                dng_core::dng_tags::tcCFAPlaneColor as uint16,
+                ttByte as uint16,
+                3,
+                vec![0, 1, 2],
+            ),
+            entry(
+                dng_core::dng_tags::tcCFALayout as uint16,
+                ttShort as uint16,
+                1,
+                u16v(&[1]),
+            ),
+            entry(
+                dng_core::dng_tags::tcActiveArea as uint16,
+                ttLong as uint16,
+                4,
+                u32v(&[0, 0, 4, 4]),
+            ),
+            entry(
+                tcBlackLevelRepeatDim as uint16,
+                ttShort as uint16,
+                2,
+                u16v(&[2, 2]),
+            ),
+            entry(
+                dng_core::dng_tags::tcBlackLevel as uint16,
+                ttRational as uint16,
+                4,
+                rational_bytes(0, 1)
+                    .iter()
+                    .cloned()
+                    .chain(rational_bytes(0, 1))
+                    .chain(rational_bytes(0, 1))
+                    .chain(rational_bytes(0, 1))
+                    .collect(),
+            ),
+            entry(
+                dng_core::dng_tags::tcWhiteLevel as uint16,
+                ttRational as uint16,
+                1,
+                rational_bytes(65535, 1),
+            ),
+            entry(
+                dng_core::dng_tags::tcColorMatrix1 as uint16,
+                ttSRational as uint16,
+                9,
+                color_matrix1_rationals(),
+            ),
+            entry(
+                tcUniqueCameraModel as uint16,
+                ttAscii as uint16,
+                15,
+                b"FeatureCamera\0".to_vec(),
+            ),
+            // Strips (IsValidDNG requires strips or tiles).
+            entry(
+                dng_core::dng_tags::tcRowsPerStrip as uint16,
+                ttLong as uint16,
+                1,
+                u32v(&[4]),
+            ),
+            entry(
+                dng_core::dng_tags::tcStripByteCounts as uint16,
+                ttLong as uint16,
+                1,
+                u32v(&[32]),
+            ),
+            entry(
+                dng_core::dng_tags::tcStripOffsets as uint16,
+                ttLong as uint16,
+                1,
+                u32v(&[2048]),
+            ),
+            // Exif IFD pointer (patched below).
+            entry(tcExifIFD as uint16, ttLong as uint16, 1, u32v(&[0])),
+            // ExtraCameraProfiles: 1 profile (offset patched below).
+            entry(
+                dng_core::dng_tags::tcExtraCameraProfiles as uint16,
+                ttLong as uint16,
+                1,
+                u32v(&[extended_block_offset_placeholder]),
+            ),
+            // DNGPrivateData: minimal "Adobe" prefix (no sections).
+            entry(tcDNGPrivateData as uint16, ttByte as uint16, 6, b"Adobe\0".to_vec()),
+            entry(tcDNGVersion as uint16, ttByte as uint16, 4, vec![1, 4, 0, 0]),
+            entry(
+                tcDNGBackwardVersion as uint16,
+                ttByte as uint16,
+                4,
+                vec![1, 1, 0, 0],
+            ),
+        ];
+
+        // Exif IFD (chained via ExifIFD pointer): exposure 1/100.
+        let exif_ifd = Ifd {
+            entries: vec![entry(
+                tcExposureTime as uint16,
+                ttRational as uint16,
+                1,
+                rational_bytes(1, 100),
+            )],
+            next: 0,
+        };
+
+        // Chained thumbnail IFD.
+        let thumb_ifd = Ifd {
+            entries: vec![
+                entry(
+                    tcNewSubFileType as uint16,
+                    ttLong as uint16,
+                    1,
+                    u32v(&[1]), // preview
+                ),
+                entry(tcImageWidth as uint16, ttLong as uint16, 1, u32v(&[2])),
+                entry(tcImageLength as uint16, ttLong as uint16, 1, u32v(&[2])),
+                entry(tcBitsPerSample as uint16, ttShort as uint16, 1, u16v(&[8])),
+                entry(tcCompression as uint16, ttShort as uint16, 1, u16v(&[1])),
+                entry(
+                    tcPhotometricInterpretation as uint16,
+                    ttShort as uint16,
+                    1,
+                    u16v(&[1]), // BlackIsZero thumbnail
+                ),
+                entry(tcSamplesPerPixel as uint16, ttShort as uint16, 1, u16v(&[1])),
+                entry(
+                    dng_core::dng_tags::tcRowsPerStrip as uint16,
+                    ttLong as uint16,
+                    1,
+                    u32v(&[2]),
+                ),
+                entry(
+                    dng_core::dng_tags::tcStripByteCounts as uint16,
+                    ttLong as uint16,
+                    1,
+                    u32v(&[4]),
+                ),
+                entry(
+                    dng_core::dng_tags::tcStripOffsets as uint16,
+                    ttLong as uint16,
+                    1,
+                    u32v(&[2048]),
+                ),
+            ],
+            next: 0,
+        };
+
+        let main_ifd = Ifd {
+            entries: cfa_entries,
+            next: 0, // patched after serialization below
+        };
+
+        // The thumbnail is a CHAINED IFD; build_tiff links ifds[1..] as the
+        // chain after ifds[0]. Serialize main + exif IFD separately: the
+        // ExifIFD is referenced by pointer (not the chain), so hand-build.
+
+        let mut tiff = build_tiff(&[main_ifd.clone(), exif_ifd.clone(), thumb_ifd.clone()]);
+
+        // Patch: main_ifd.next = 0 (no chain) — build_tiff set it to
+        // ifd_offsets[1] (the exif IFD). The chain must instead be:
+        // main -> thumbnail. And the ExifIFD pointer -> exif offset.
+        // Recompute offsets the same way ifd_offsets_of does.
+
+        let ifd_offsets = ifd_offsets_of(&[
+            main_ifd.clone(),
+            exif_ifd.clone(),
+            thumb_ifd.clone(),
+        ]);
+
+        // main.next -> thumbnail (third IFD).
+        let main_next_pos = ifd_offsets[0] as usize + 2 + main_ifd.entries.len() * 12;
+        tiff[main_next_pos..main_next_pos + 4]
+            .copy_from_slice(&ifd_offsets[2].to_le_bytes());
+        // main.next should NOT point at the exif IFD (it was auto-linked);
+        // overwriting with the thumbnail makes the chain: main -> thumb.
+
+        // ExifIFD pointer in main -> exif IFD offset.
+        // Find the tcExifIFD entry payload offset (count 1, 4 bytes -> it is
+        // out-of-line? count 1 * 4 bytes = 4 -> inline in the value field).
+        // The value field is inline, so patch inside the IFD entry.
+        let mut pos = ifd_offsets[0] as usize + 2;
+        for entry in &main_ifd.entries {
+            if entry.tag == tcExifIFD as u16 {
+                tiff[pos + 8..pos + 12]
+                    .copy_from_slice(&ifd_offsets[1].to_le_bytes());
+                break;
+            }
+            pos += 12;
+        }
+
+        // ExtraCameraProfiles value -> extended block appended at the end.
+        let block_offset = tiff.len() as u32;
+        tiff.extend_from_slice(&block);
+        let mut pos = ifd_offsets[0] as usize + 2;
+        for entry in &main_ifd.entries {
+            if entry.tag == dng_core::dng_tags::tcExtraCameraProfiles as u16 {
+                tiff[pos + 8..pos + 12].copy_from_slice(&block_offset.to_le_bytes());
+                break;
+            }
+            pos += 12;
+        }
+
+        // Parse everything.
+
+        let mut stream = DngMemoryStream::new().stream();
+        stream.put(&tiff).unwrap();
+        stream.set_read_position(0).unwrap();
+
+        let mut host = DngHost::new();
+        let mut info = DngInfo::new();
+
+        info.parse(&mut host, &mut stream).unwrap();
+        info.post_parse(&mut host).unwrap();
+
+        assert!(info.is_valid_dng());
+        assert_eq!(info.main_index, 0);
+
+        // Chained thumbnail IFD.
+
+        assert_eq!(info.chained_ifd_count(), 1);
+        assert_eq!(
+            info.chained_ifd[0].new_sub_file_type,
+            1
+        );
+
+        // Exif data flowed through.
+
+        assert_eq!(info.exif.exposure_time.d, 100);
+
+        // The extended extra profile.
+
+        assert_eq!(info.shared.extra_camera_profiles.len(), 1);
+
+        let extra = &info.shared.extra_camera_profiles[0];
+        assert_eq!(extra.profile_name.get_str(), Some("Extra"));
+        assert_eq!(extra.profile_hues, 2);
+        assert!(extra.hue_sat_deltas1_offset != 0);
+        assert_eq!(extra.baseline_exposure_offset.as_real64(), 1.0 / 3.0);
+
+        // Parse the negative and confirm the profile lands with its tables.
+
+        let mut negative = crate::dng_negative::DngNegative::new(&mut host).unwrap();
+
+        negative.parse(&mut host, &mut stream, &mut info).unwrap();
+        negative.post_parse(&mut host, &mut stream, &mut info).unwrap();
+
+        assert!(negative.profile_count() >= 2, "main + extra profiles");
+
+        // The extra profile's hue-sat table must be loaded (2*3*1 deltas).
+
+        let mut found = false;
+
+        for profile in &negative.camera_profiles {
+            if profile.name().get_str() == Some("Extra") {
+                found = true;
+                let map = profile.hue_sat_deltas1();
+                let (h, s, v) = map.get_divisions();
+                assert_eq!((h, s, v), (2, 3, 1));
+                let delta = map.get_delta(0, 1, 0).unwrap();
+                assert!((delta.hue_shift - 0.75).abs() < 1e-6);
+            }
+        }
+
+        assert!(found, "extra profile not found by name");
+    }
+
     fn parse_minimal_dng() {
         let ifd = Ifd {
             entries: main_ifd_entries(),
