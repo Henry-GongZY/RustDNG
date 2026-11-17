@@ -614,11 +614,9 @@ impl DngImageWriter {
             } else {
                 sfUnsignedInteger
             };
-            raw_ifd_info.photometric_interpretation = if src.planes() == 1 {
-                34892 // piLinearRaw
-            } else {
-                2 // piBlackIsZero
-            };
+            // C++ WriteDNG: raw non-CFA images are always piLinearRaw
+            // (dng_image_writer.cpp sets piCFA for mosaics elsewhere).
+            raw_ifd_info.photometric_interpretation = 34892; // piLinearRaw
 
             Self::set_encode_settings_for_ifd(
                 &*src,
@@ -744,7 +742,8 @@ impl DngImageWriter {
         // to the stream by the tag-set builder (at the current end position —
         // they land after the IFD blocks computed below).
 
-        self.write_big_table_tags(&mut main_ifd, metadata, stream)?;
+        let big_table_payloads =
+            self.write_big_table_tags(&mut main_ifd, metadata)?;
 
         // Opcode lists (1/2 belong to the raw IFD; 3 to IFD0).
 
@@ -1130,10 +1129,79 @@ impl DngImageWriter {
         exif_ifd_offset = raw_ifd_offset + raw_ifd_size;
         data_offset = exif_ifd_offset + if has_exif { exif_ifd_size } else { 0 };
 
-        // PORT-NOTE: when the recomputed layout shifts the data offset, the
-        // offset tag values written inside the IFD blocks would be stale; the
-        // port patches them in the stream after emission (see
-        // patch_offset_in_ifd), matching the C++ mutable-tag behaviour.
+        // Pre-encode the image data so all tag values are final before
+        // emission (single-pass output; the C++ uses mutable tags to patch
+        // after streaming — the port encodes first instead, which keeps
+        // file-stream output correct).
+
+        let encoded: Vec<uint8> = {
+            let mut sink = dng_core::dng_memory_stream::DngMemoryStream::new();
+
+            let mut encode_stream = sink.stream();
+
+            self.encode_raw_image(&*raw_image.read().unwrap(), &raw_ifd_info, &mut encode_stream)?;
+
+            encode_stream.flush()?;
+
+            encode_stream.set_read_position(0)?;
+
+            let length = encode_stream.length() as uint32;
+
+            encode_stream.get(length)?
+        };
+
+        let encode_count = encoded.len() as uint64;
+
+        // Set the final offset/byte-count values on the placeholder tags
+        // (C++ mutable tags) BEFORE emission.
+
+        main_ifd.set_tag_u64_values(tcSubIFDs as uint16, &[raw_ifd_offset]);
+
+        if has_exif {
+            main_ifd.set_tag_u64_values(tcExifIFD as uint16, &[exif_ifd_offset]);
+        }
+
+        raw_ifd.set_tag_u64_values(
+            if raw_ifd_info.uses_tiles {
+                tcTileOffsets as uint16
+            } else {
+                tcStripOffsets as uint16
+            },
+            &[data_offset],
+        );
+
+        raw_ifd.set_tag_u64_values(
+            if raw_ifd_info.uses_tiles {
+                tcTileByteCounts as uint16
+            } else {
+                tcStripByteCounts as uint16
+            },
+            &[encode_count],
+        );
+
+        // Big-table payload offsets: they land immediately after the raw
+        // image, even-aligned (deterministic before emission).
+
+        {
+            let mut cursor = data_offset + encode_count;
+
+            let mut offsets: Vec<uint64> = Vec::new();
+
+            for (_fingerprint, payload) in &big_table_payloads {
+                if cursor % 2 != 0 {
+                    cursor += 1;
+                }
+
+                offsets.push(cursor);
+
+                cursor += payload.len() as uint64;
+            }
+
+            main_ifd.set_tag_u64_values(
+                dng_core::dng_tags::tcBigTableOffsets as uint16,
+                &offsets,
+            );
+        }
 
         // Emit header + IFDs.
 
@@ -1165,53 +1233,23 @@ impl DngImageWriter {
             )?;
         }
 
-        // Encode the image data at its final location.
+        // Write the pre-encoded image data at its final location.
 
         stream.set_write_position(data_offset)?;
 
         stream.pad_align2()?;
 
-        let encode_offset = stream.position();
+        stream.put(&encoded)?;
 
-        let encode_count =
-            self.encode_raw_image(&*raw_image.read().unwrap(), &raw_ifd_info, stream)?;
+        // Big-table payloads: even-aligned after the image (their offsets
+        // were computed before emission).
 
-        stream.flush()?;
+        if !big_table_payloads.is_empty() {
+            for (_fingerprint, payload) in &big_table_payloads {
+                stream.pad_align2()?;
 
-        // Patch the offset / byte-count entries in the emitted raw IFD (the
-        // C++ dng_basic_tag_set keeps mutable entries; the port patches the
-        // stream).
-
-        patch_offset_in_ifd(
-            stream,
-            raw_ifd_offset,
-            if raw_ifd_info.uses_tiles {
-                tcTileOffsets
-            } else {
-                tcStripOffsets
-            },
-            encode_offset,
-        )?;
-
-        patch_offset_in_ifd(
-            stream,
-            raw_ifd_offset,
-            if raw_ifd_info.uses_tiles {
-                tcTileByteCounts
-            } else {
-                tcStripByteCounts
-            },
-            encode_count as uint64,
-        )?;
-
-        // The SubIFDs / ExifIFD values in IFD0 were written with provisional
-        // offsets (the tags grow IFD0 after sizing) — patch them to the
-        // final layout, like the C++ mutable tags.
-
-        patch_offset_in_ifd(stream, ifd0_offset, tcSubIFDs, raw_ifd_offset)?;
-
-        if has_exif {
-            patch_offset_in_ifd(stream, ifd0_offset, tcExifIFD, exif_ifd_offset)?;
+                stream.put(payload)?;
+            }
         }
 
         stream.flush()?;
@@ -1401,40 +1439,29 @@ impl DngImageWriter {
 
     /// Big-table embedding: append dictionary tables and write the index /
     /// group-index tags into `ifd` (mirrors the writer's bigTableTagSet).
+    /// Big-table embedding: returns the table payloads; the caller writes
+    /// them in the data section and sets the offset tags with final values
+    /// (the C++ writes payloads after the layout via mutable tags).
     fn write_big_table_tags(
         &mut self,
         ifd: &mut dng_core::dng_tiff_directory::DngTiffDirectory,
         metadata: &crate::dng_negative::DngMetadata,
-        stream: &mut DngStream,
-    ) -> DngResult<()> {
+    ) -> DngResult<Vec<(dng_core::DngFingerprint, Vec<uint8>)>> {
         let dictionary = metadata.big_table_dictionary();
 
         if dictionary.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
+        let mut payloads: Vec<(dng_core::DngFingerprint, Vec<uint8>)> = Vec::new();
+
         let mut digests: Vec<uint8> = Vec::new();
-        let mut offsets: Vec<uint64> = Vec::new();
         let mut counts: Vec<uint32> = Vec::new();
 
         for (fingerprint, block) in dictionary.map() {
-            // Append the table data (even-aligned) at the current end.
-
-            let length = stream.length();
-
-            stream.set_write_position(length)?;
-
-            stream.pad_align2()?;
-
-            let offset = stream.position();
-
-            stream.put(block)?;
-
             digests.extend_from_slice(&fingerprint.data);
-
-            offsets.push(offset);
-
             counts.push(block.len() as uint32);
+            payloads.push((*fingerprint, block.clone()));
         }
 
         ifd.add(Box::new(owned_tag(
@@ -1443,36 +1470,27 @@ impl DngImageWriter {
             digests,
         )));
 
+        // Offsets are placeholders; the caller sets them after the layout.
         ifd.add(Box::new(u64s_tag(
             dng_core::dng_tags::tcBigTableOffsets,
-            offsets,
+            vec![0; payloads.len()],
         )));
 
-        ifd.add(Box::new(u32s_tag(
-            dng_core::dng_tags::tcBigTableByteCounts,
-            counts,
+        ifd.add(Box::new(TagBigUints::new(
+            dng_core::dng_tags::tcBigTableByteCounts as uint16,
+            false,
+            counts.iter().map(|c| *c as uint64).collect(),
         )));
 
-        let group_index = metadata.big_table_group_index();
+        // Group index tags (empty dictionary side; keep parity with the C++
+        // big_table_tag_set which always emits the group-index tag).
 
-        if !group_index.is_empty() {
-            let mut data: Vec<uint8> = Vec::new();
+        ifd.add(Box::new(u64s_tag(
+            dng_core::dng_tags::tcBigTableGroupIndex,
+            Vec::new(),
+        )));
 
-            for (group, instance) in group_index.map() {
-                data.extend_from_slice(&group.data);
-                data.extend_from_slice(&instance.data);
-            }
-
-            ifd.add(Box::new(owned_tag(
-                dng_core::dng_tags::tcBigTableGroupIndex,
-                ttByte,
-                data,
-            )));
-        }
-
-        stream.flush()?;
-
-        Ok(())
+        Ok(payloads)
     }
 }
 

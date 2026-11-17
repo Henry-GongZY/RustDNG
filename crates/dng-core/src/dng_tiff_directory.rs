@@ -37,6 +37,13 @@ pub trait TiffTag: Send + Sync {
     /// `SetCount (count)`.
     fn set_count(&mut self, count: uint32);
 
+    /// Mutable-value hook (the C++ tags carry pointer-based values; the
+    /// port lets the writer update u64-valued tags in place after the
+    /// final layout is known).  Returns false when unsupported.
+    fn set_u64_values(&mut self, _values: &[uint64]) -> bool {
+        false
+    }
+
     /// `Size ()`.
     fn size(&self) -> uint32 {
         tag_type_size(self.tag_type() as uint32) * self.count()
@@ -322,6 +329,10 @@ impl TiffTag for TagBigUints {
     }
     fn count(&self) -> uint32 {
         self.data.len() as uint32
+    }
+    fn set_u64_values(&mut self, values: &[uint64]) -> bool {
+        self.data = values.to_vec();
+        true
     }
     fn set_count(&mut self, count: uint32) {
         self.data.truncate(count as usize);
@@ -703,6 +714,32 @@ impl DngTiffDirectory {
     /// sorted position ("Tags must be sorted in increasing order of tag
     /// code" — inserted before the first larger code), so callers may add
     /// tags in any order.
+    /// Update a u64-valued tag in place (pre-emission), C++ mutable-tag
+    /// behaviour.
+    pub fn set_tag_u64_values(&mut self, code: uint16, values: &[uint64]) -> bool {
+        for tag in self.tags.iter_mut() {
+            if tag.code() == code {
+                return tag.set_u64_values(values);
+            }
+        }
+        false
+    }
+
+    pub fn tag_count(&self) -> usize {
+        self.tags.len()
+    }
+
+    /// Debug: per-tag size ledger.
+    pub fn size_ledger(&self) -> Vec<(uint16, uint16, uint32, uint32)> {
+        self.tags
+            .iter()
+            .map(|t| {
+                let value = if t.size() > 4 { (t.size() + 1) & !1 } else { 0 };
+                (t.code(), t.tag_type(), t.count(), value)
+            })
+            .collect()
+    }
+
     pub fn add(&mut self, tag: Box<dyn TiffTag>) {
         let insert_index = self
             .tags
@@ -751,7 +788,7 @@ impl DngTiffDirectory {
             let data_size = tag.size();
 
             if data_size > if self.big_tiff { 8 } else { 4 } {
-                tag_size += data_size;
+                tag_size += (data_size + 1) & !1;
             }
 
             size += tag_size;

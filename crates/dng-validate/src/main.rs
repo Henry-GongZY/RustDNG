@@ -32,6 +32,15 @@ struct Options {
     no_stages: bool,
     render: bool,
     threads: u32,
+    /// `-dng <file>` — re-save the validated negative.
+    out_dng: Option<String>,
+    /// `--ppm <file>` — write the rendered image as binary PPM.
+    out_ppm: Option<String>,
+    /// `-cs1..-cs6/-csP3/-cs2020` — render color space index.
+    color_space: u8,
+    /// `-16` / `-32` — render output depth.
+    render_16bit: bool,
+    render_32bit: bool,
     files: Vec<String>,
 }
 
@@ -156,7 +165,37 @@ fn validate_file(options: &Options, path: &str) -> dng_core::DngResult<()> {
         if options.render {
             let mut render = DngRender::new(&negative)?;
 
-            render.set_final_pixel_type(dng_core::dng_tag_types::ttShort);
+            let pixel_type = if options.render_32bit {
+                dng_core::dng_tag_types::ttFloat
+            } else if options.render_16bit || options.render_32bit {
+                dng_core::dng_tag_types::ttShort
+            } else {
+                dng_core::dng_tag_types::ttByte
+            };
+
+            render.set_final_pixel_type(pixel_type);
+
+            // Color space (C++ dng_validate -cs1..-cs2020).
+
+            use dng_core::dng_color_space as cs;
+
+            let space = match options.color_space {
+                1 => cs::space_srgb(),
+                2 => cs::space_adobe_rgb(),
+                3 => cs::space_pro_photo(),
+                4 => cs::space_adobe_rgb(), // -cs4 ColorMatch: closest built-in
+                5 => cs::space_gray_gamma18(),
+                6 => cs::space_gray_gamma22(),
+                7 => cs::space_display_p3(),
+                8 => cs::space_rec2020(),
+                _ => cs::space_srgb(),
+            };
+
+            render.set_final_space(
+                space.matrix_from_pcs().clone(),
+                space.gamma_function(),
+                space.is_monochrome(),
+            );
 
             let rendered = render.render(&negative)?;
 
@@ -169,7 +208,69 @@ fn validate_file(options: &Options, path: &str) -> dng_core::DngResult<()> {
                 out.planes(),
                 out.pixel_type()
             );
+
+            // PPM export of the rendered image (8-bit; gray or RGB).
+
+            if let Some(ppm_path) = &options.out_ppm {
+                write_ppm(ppm_path, &out)?;
+                println!("  wrote {}", ppm_path);
+            }
         }
+    }
+
+    // -dng <file>: re-save the validated negative (exercises the writer on
+    // real data).
+
+    if let Some(dng_path) = &options.out_dng {
+        let mut out_stream = DngFileStream::open_write(Path::new(dng_path))?;
+
+        let mut writer = dng_sdk::dng_image_writer::DngImageWriter::new();
+
+        writer.write_dng_uncompressed(&mut host, &mut out_stream, &mut negative, false)?;
+
+        println!("  wrote {}", dng_path);
+    }
+
+    Ok(())
+}
+
+/// Binary PPM (P5 gray / P6 RGB) export for the rendered image.  The C++
+/// dng_validate writes TIFF dumps instead; PPM keeps the port dependency
+/// free while serving the same verification purpose.
+fn write_ppm(path: &str, image: &std::sync::RwLockReadGuard<dyn dng_core::DngImage>) -> dng_core::DngResult<()> {
+    use std::io::Write;
+
+    let width = image.width();
+    let height = image.height();
+    let planes = image.planes();
+
+    let mut buf = dng_core::dng_pixel_buffer::DngPixelBuffer::with_planar_config(
+        image.bounds(),
+        0,
+        planes,
+        dng_core::dng_tag_types::ttByte,
+        dng_core::dng_tag_values::pcInterleaved,
+        dng_core::dng_pixel_buffer::DngPixelBuffer::allocate_data(
+            image.bounds(),
+            planes,
+            dng_core::dng_tag_types::ttByte,
+        )?,
+    )?;
+
+    image.do_get(&mut buf)?;
+
+    let samples = buf.as_u8_slice().ok_or_else(dng_core::program_error)?;
+
+    let file = std::fs::File::create(path).map_err(|_| dng_core::dng_exceptions::open_file_error())?;
+
+    let mut writer = std::io::BufWriter::new(file);
+
+    if planes == 3 {
+        write!(writer, "P6\n{} {}\n255\n", width, height).map_err(|_| dng_core::dng_exceptions::write_failure())?;
+        writer.write_all(samples).map_err(|_| dng_core::dng_exceptions::write_failure())?;
+    } else {
+        write!(writer, "P5\n{} {}\n255\n", width, height).map_err(|_| dng_core::dng_exceptions::write_failure())?;
+        writer.write_all(samples).map_err(|_| dng_core::dng_exceptions::write_failure())?;
     }
 
     Ok(())
@@ -181,6 +282,11 @@ fn main() {
         no_stages: false,
         render: false,
         threads: 1,
+        out_dng: None,
+        out_ppm: None,
+        color_space: 1, // sRGB
+        render_16bit: false,
+        render_32bit: false,
         files: Vec::new(),
     };
 
@@ -195,6 +301,28 @@ fn main() {
                 let v = args.next().unwrap_or_default();
                 options.threads = v.parse().unwrap_or(1);
             }
+            "-dng" => {
+                let v = args.next().unwrap_or_default();
+                if !v.is_empty() {
+                    options.out_dng = Some(v);
+                }
+            }
+            "--ppm" => {
+                let v = args.next().unwrap_or_default();
+                if !v.is_empty() {
+                    options.out_ppm = Some(v);
+                }
+            }
+            "-cs1" => options.color_space = 1,
+            "-cs2" => options.color_space = 2,
+            "-cs3" => options.color_space = 3,
+            "-cs4" => options.color_space = 4,
+            "-cs5" => options.color_space = 5,
+            "-cs6" => options.color_space = 6,
+            "-csP3" => options.color_space = 7,
+            "-cs2020" => options.color_space = 8,
+            "-16" => options.render_16bit = true,
+            "-32" => options.render_32bit = true,
             "-h" | "--help" => std::process::exit(print_usage()),
             other => options.files.push(other.to_string()),
         }
