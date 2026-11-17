@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        run: cargo test --workspace
+      - name: Validate sample DNGs
+        shell: bash
+        run: |
+          # The official sample files are distributed inside the Adobe DNG
+          # SDK zip (download separately, see README); skip when absent.
+          if [ -d vendor/extracted/dng_sdk_1_7_1/sample_files ]; then
+            cargo run -p dng-validate -- vendor/extracted/dng_sdk_1_7_1/sample_files/*.dng
+          else
+            echo "sample files not present; skipping end-to-end validation"
+          fi
