@@ -5878,9 +5878,15 @@ impl DngNegative {
     pub fn lossy_compress_mosaic_jxl(
         &mut self,
         _host: &mut DngHost,
-        _writer: &mut dyn std::any::Any,
+        _writer: &mut crate::dng_image_writer::DngImageWriter,
     ) -> DngResult<()> {
-        Err(dng_core::not_yet_implemented()) // requires dng_image_writer
+        // PORT-NOTE(dng_negative.cpp:6183): requires the proxy-encode
+        // machinery that has not been ported yet:
+        //   * the static EncodeImageForCompression helper (histogram-based
+        //     range trim + dng_jxl_proxy_curve / dng_jpeg_proxy_curve tone
+        //     curves), and
+        //   * the dng_lossy_mosaic_task area task (padded mosaic repacking).
+        Err(dng_core::not_yet_implemented())
     }
 
     /// `LosslessCompressJXL (host, writer, nearLosslessOK)`.
@@ -5890,16 +5896,22 @@ impl DngNegative {
     pub fn lossless_compress_jxl(
         &mut self,
         _host: &mut DngHost,
-        _writer: &mut dyn std::any::Any,
+        _writer: &mut crate::dng_image_writer::DngImageWriter,
         _near_lossless_ok: bool,
     ) -> DngResult<()> {
-        Err(dng_core::not_yet_implemented()) // requires dng_image_writer
+        // PORT-NOTE(dng_negative.cpp:6493): needs DngJxlImage::encode wired
+        // to the writer tile encoder plus the Interleave2D helper
+        // (dng_interleave_task, dng_read_image.cpp:3151) for the mosaic
+        // path. The core JXL encode exists (dng-jxl crate + writer tile
+        // dispatch); the missing pieces are the interleave task and the
+        // use-case quality mapping table.
+        Err(dng_core::not_yet_implemented())
     }
 
     /// `EncodeRawProxy (host, srcImage, opcodeList, blackLevel)`.
     ///
-    /// PORT-NOTE(dng_negative.cpp:6630): requires `dng_image_writer`
-    /// (Agent B); returns NotSupported until the writer module lands.
+    /// PORT-NOTE(dng_negative.cpp:6630): requires EncodeImageForCompression
+    /// (histogram trim + proxy curves) — see lossy_compress_mosaic_jxl.
     pub fn encode_raw_proxy(
         &self,
         _host: &mut DngHost,
