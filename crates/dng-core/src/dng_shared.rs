@@ -117,10 +117,17 @@ pub struct DngCameraProfileInfo {
     pub unique_camera_model: DngString,
     pub profile_group_name: DngString,
     pub profile_dynamic_range: DngCameraProfileDynamicRange,
-    // Phase-2 raw pointers preserved as offsets/counts:
+
+    /// tcProfileGainTableMap2: parsed by the SDK layer from this offset
+    /// (the `DngGainTableMap` type lives in dng-sdk).
     pub profile_gain_table_map_offset: uint64,
     pub profile_gain_table_map_count: uint32,
     pub profile_gain_table_map_tag_version: uint32,
+
+    /// tcRGBTables / tcRGBTablesDraft: offset+count for the SDK layer.
+    pub masked_rgb_tables_offset: uint64,
+    pub masked_rgb_tables_count: uint32,
+    pub masked_rgb_tables_is_draft: bool,
 }
 
 impl DngCameraProfileInfo {
@@ -130,6 +137,9 @@ impl DngCameraProfileInfo {
             calibration_illuminant1: 0xFFFFFFFF,
             calibration_illuminant2: 0xFFFFFFFF,
             calibration_illuminant3: 0xFFFFFFFF,
+            masked_rgb_tables_offset: 0,
+            masked_rgb_tables_count: 0,
+            masked_rgb_tables_is_draft: false,
             ..Default::default()
         }
     }
@@ -216,16 +226,394 @@ impl DngCameraProfileInfo {
                 if !check_tag_type(parent_code, tag_code, tag_type, &[ttSRational as uint16]) {
                     return Ok(false);
                 }
-                if tag_count % 3 != 0 {
+
+                // Kludge - Hasselblad FFF files are very DNG-like, but
+                // sometimes only have a ColorMatrix2 tag and no ColorMatrix1
+                // tag (dng_shared.cpp tcColorMatrix2).
+
+                let hasselblad_hack = self.color_planes == 0;
+
+                if hasselblad_hack {
+                    self.color_planes = crate::dng_utils::pin_uint32(
+                        0,
+                        tag_count / 3,
+                        crate::dng_sdk_limits::kMaxColorPlanes,
+                    );
+                }
+
+                if !check_color_image(parent_code, tag_code, self.color_planes) {
                     return Ok(false);
                 }
-                let rows = 3;
-                let cols = tag_count / rows;
+
+                if tag_count != self.color_planes * 3 {
+                    return Ok(false);
+                }
+
                 if let Some(m) = parse_matrix_tag(
-                    stream, parent_code, tag_code, tag_type, tag_count, rows, cols,
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_type,
+                    tag_count,
+                    self.color_planes,
+                    3,
                 )? {
                     self.color_matrix2 = m;
                 }
+
+                if hasselblad_hack {
+                    self.color_matrix1 = self.color_matrix2.clone();
+                    self.color_matrix2 = DngMatrix::default();
+                }
+            }
+
+            x if x == tcColorMatrix3 => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttSRational as uint16]) {
+                    return Ok(false);
+                }
+
+                if self.color_planes == 0 {
+                    self.color_planes = crate::dng_utils::pin_uint32(
+                        0,
+                        tag_count / 3,
+                        crate::dng_sdk_limits::kMaxColorPlanes,
+                    );
+                }
+
+                if !check_color_image(parent_code, tag_code, self.color_planes) {
+                    return Ok(false);
+                }
+
+                if tag_count != self.color_planes * 3 {
+                    return Ok(false);
+                }
+
+                if let Some(m) = parse_matrix_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_type,
+                    tag_count,
+                    self.color_planes,
+                    3,
+                )? {
+                    self.color_matrix3 = m;
+                }
+            }
+
+            x if x == tcForwardMatrix1 || x == tcForwardMatrix2 || x == tcForwardMatrix3 => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttSRational as uint16]) {
+                    return Ok(false);
+                }
+
+                if !check_color_image(parent_code, tag_code, self.color_planes) {
+                    return Ok(false);
+                }
+
+                // C++ ParseMatrixTag(stream, ..., 3, fColorPlanes, matrix).
+
+                if let Some(m) = parse_matrix_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_type,
+                    tag_count,
+                    3,
+                    self.color_planes,
+                )? {
+                    match tag_code {
+                        tcForwardMatrix1 => self.forward_matrix1 = m,
+                        tcForwardMatrix2 => self.forward_matrix2 = m,
+                        _ => self.forward_matrix3 = m,
+                    }
+                }
+            }
+
+            x if x == tcReductionMatrix1 || x == tcReductionMatrix2 || x == tcReductionMatrix3 => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttSRational as uint16]) {
+                    return Ok(false);
+                }
+
+                if !check_color_image(parent_code, tag_code, self.color_planes) {
+                    return Ok(false);
+                }
+
+                if let Some(m) = parse_matrix_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_type,
+                    tag_count,
+                    3,
+                    self.color_planes,
+                )? {
+                    match tag_code {
+                        tcReductionMatrix1 => self.reduction_matrix1 = m,
+                        tcReductionMatrix2 => self.reduction_matrix2 = m,
+                        _ => self.reduction_matrix3 = m,
+                    }
+                }
+            }
+
+            x if x == tcIlluminantData1 || x == tcIlluminantData2 || x == tcIlluminantData3 => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16]) {
+                    return Ok(false);
+                }
+                if !check_tag_count(parent_code, tag_code, tag_count, 2, 10000) {
+                    return Ok(false);
+                }
+
+                let data = match tag_code {
+                    tcIlluminantData1 => &mut self.illuminant_data1,
+                    tcIlluminantData2 => &mut self.illuminant_data2,
+                    _ => &mut self.illuminant_data3,
+                };
+
+                data.get_from_stream(stream, tag_count)?;
+            }
+
+            x if x == tcProfileEmbedPolicy => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16]) {
+                    return Ok(false);
+                }
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+                self.embed_policy = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcProfileHueSatMapData1 || x == tcProfileHueSatMapData2 || x == tcProfileHueSatMapData3 => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttFloat as uint16]) {
+                    return Ok(false);
+                }
+                if self.profile_sats == 0 {
+                    return Ok(false);
+                }
+
+                // Either the full hue*sat*val*3 table, or a table with the
+                // sat==0 row skipped (dng_shared.cpp).
+
+                let hue_count = self.profile_hues;
+                let val_count = self.profile_vals;
+
+                let skip_sat0 = tag_count
+                    == hue_count
+                        .checked_mul(self.profile_sats.wrapping_sub(1))
+                        .unwrap_or(0)
+                        .checked_mul(val_count * 3)
+                        .unwrap_or(0);
+
+                if !skip_sat0 {
+                    let expected = hue_count
+                        .checked_mul(val_count)
+                        .and_then(|v| v.checked_mul(self.profile_sats))
+                        .and_then(|v| v.checked_mul(3))
+                        .unwrap_or(u32::MAX);
+
+                    if !check_tag_count(parent_code, tag_code, tag_count, expected, 0) {
+                        return Ok(false);
+                    }
+                }
+
+                self.big_endian = stream.big_endian();
+
+                let (offset_field, count_field) = match tag_code {
+                    tcProfileHueSatMapData1 => (
+                        &mut self.hue_sat_deltas1_offset,
+                        &mut self.hue_sat_deltas1_count,
+                    ),
+                    tcProfileHueSatMapData2 => (
+                        &mut self.hue_sat_deltas2_offset,
+                        &mut self.hue_sat_deltas2_count,
+                    ),
+                    _ => (
+                        &mut self.hue_sat_deltas3_offset,
+                        &mut self.hue_sat_deltas3_count,
+                    ),
+                };
+
+                *offset_field = tag_offset;
+                *count_field = tag_count;
+            }
+
+            x if x == tcProfileHueSatMapEncoding => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16]) {
+                    return Ok(false);
+                }
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+                self.hue_sat_map_encoding = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcProfileLookTableDims => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16, ttShort as uint16]) {
+                    return Ok(false);
+                }
+                if !check_tag_count(parent_code, tag_code, tag_count, 2, 3) {
+                    return Ok(false);
+                }
+                self.look_table_hues = stream.tag_value_uint32(tag_type)?;
+                self.look_table_sats = stream.tag_value_uint32(tag_type)?;
+                if tag_count > 2 {
+                    self.look_table_vals = stream.tag_value_uint32(tag_type)?;
+                } else {
+                    self.look_table_vals = 1;
+                }
+            }
+
+            x if x == tcProfileLookTableData => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttFloat as uint16]) {
+                    return Ok(false);
+                }
+                if self.look_table_sats == 0 {
+                    return Ok(false);
+                }
+
+                let hue_count = self.look_table_hues;
+                let val_count = self.look_table_vals;
+
+                let skip_sat0 = tag_count
+                    == hue_count
+                        .checked_mul(self.look_table_sats.wrapping_sub(1))
+                        .unwrap_or(0)
+                        .checked_mul(val_count * 3)
+                        .unwrap_or(0);
+
+                if !skip_sat0 {
+                    let expected = hue_count
+                        .checked_mul(val_count)
+                        .and_then(|v| v.checked_mul(self.look_table_sats))
+                        .and_then(|v| v.checked_mul(3))
+                        .unwrap_or(u32::MAX);
+
+                    if !check_tag_count(parent_code, tag_code, tag_count, expected, 0) {
+                        return Ok(false);
+                    }
+                }
+
+                self.big_endian = stream.big_endian();
+
+                self.look_table_offset = tag_offset;
+                self.look_table_count = tag_count;
+            }
+
+            x if x == tcProfileLookTableEncoding => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16]) {
+                    return Ok(false);
+                }
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+                self.look_table_encoding = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcBaselineExposureOffset => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttSRational as uint16]) {
+                    return Ok(false);
+                }
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+                self.baseline_exposure_offset = stream.tag_value_srational(tag_type)?;
+            }
+
+            x if x == tcDefaultBlackRender => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16]) {
+                    return Ok(false);
+                }
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+                self.default_black_render = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcProfileToneMethod => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttLong as uint16]) {
+                    return Ok(false);
+                }
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, 0) {
+                    return Ok(false);
+                }
+                self.tone_method = stream.tag_value_uint32(tag_type)?;
+            }
+
+            x if x == tcUniqueCameraModel => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttAscii as uint16]) {
+                    return Ok(false);
+                }
+                parse_string_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_count,
+                    &mut self.unique_camera_model,
+                    false,
+                )?;
+            }
+
+            x if x == tcProfileGroupName => {
+                if !check_tag_type(
+                    parent_code,
+                    tag_code,
+                    tag_type,
+                    &[ttAscii as uint16, ttByte as uint16],
+                ) {
+                    return Ok(false);
+                }
+                parse_string_tag(
+                    stream,
+                    parent_code,
+                    tag_code,
+                    tag_count,
+                    &mut self.profile_group_name,
+                    false,
+                )?;
+            }
+
+            x if x == tcProfileGainTableMap2 => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16]) {
+                    return Ok(false);
+                }
+
+                // The C++ parses the gain table map inline via
+                // dng_gain_table_map::GetStream; the type lives in dng-sdk,
+                // so record the extent and let the SDK layer parse it.
+
+                self.profile_gain_table_map_offset = tag_offset;
+                self.profile_gain_table_map_count = tag_count;
+            }
+
+            x if x == tcProfileDynamicRange => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16]) {
+                    return Ok(false);
+                }
+                if !check_tag_count(parent_code, tag_code, tag_count, 8, 0) {
+                    return Ok(false);
+                }
+
+                let version = stream.get_uint16()?;
+
+                if version != 1 {
+                    return Err(bad_format()); // "Unsupported version in ProfileDynamicRange"
+                }
+
+                self.profile_dynamic_range.version = version;
+                self.profile_dynamic_range.dynamic_range = stream.get_uint16()?;
+                self.profile_dynamic_range.hint_max_output_value = stream.get_real32()?;
+            }
+
+            x if x == tcRGBTablesDraft || x == tcRGBTables => {
+                if !check_tag_type(parent_code, tag_code, tag_type, &[ttUndefined as uint16]) {
+                    return Ok(false);
+                }
+
+                // Parsed inline by the C++ (dng_masked_rgb_tables::GetStream);
+                // the type lives in dng-sdk, so record the extent.
+
+                self.masked_rgb_tables_offset = tag_offset;
+                self.masked_rgb_tables_count = tag_count;
+                self.masked_rgb_tables_is_draft = tag_code == tcRGBTablesDraft;
             }
 
             x if x == tcProfileCalibrationSignature => {
@@ -293,22 +681,65 @@ impl DngCameraProfileInfo {
 
     /// `ParseExtended (stream)` — parse a standalone extended camera-profile
     /// block ("skipped" data referenced by offsets).
+    ///
+    /// `ParseExtended (stream)` — parse an embedded "extended" camera-profile
+    /// block: a mini TIFF directory whose byte-order marker comes first and
+    /// whose magic is 0x4352 'CR' (dng_shared.cpp:1572).
     pub fn parse_extended(&mut self, stream: &mut DngStream) -> DngResult<bool> {
-        // Magic + version header of the extended profile block (as C++):
-        //   uint16 magic ('dp' = 0x7064? actual: 0x5046 'PF'? SDK uses 0x4342?)
-        // The C++ reads a big-endian uint16 magic == 0x4D42 'MB'... preserve
-        // exact C++ constants.
-        let magic = stream.get_uint16()?;
-        if magic != 0x4D4D && magic != 0x4D42 {
+        let start_position = stream.get_position();
+
+        let byte_order = stream.get_uint16()?;
+
+        let big_endian = if byte_order == byteOrderMM as uint16 {
+            true
+        } else if byte_order == byteOrderII as uint16 {
+            false
+        } else {
             return Ok(false);
-        }
+        };
 
-        let _version = stream.get_uint16()?;
+        let saved_endian = stream.big_endian();
+        stream.set_big_endian(big_endian);
 
-        // Remaining extended data (hue-sat deltas, look tables, tone curves)
-        // is consumed by phase-2 dng_camera_profile; the structural parse
-        // stops here in phase 1 with the offsets already captured.
-        Ok(true)
+        let result = (|| -> DngResult<bool> {
+            let magic_number = stream.get_uint16()?;
+            if magic_number != magicExtendedProfile as uint16 {
+                return Ok(false);
+            }
+
+            let offset = stream.get_uint32()?;
+
+            stream.skip(crate::dng_safe_arithmetic::safe_uint32_sub(offset, 8)? as uint64)?;
+
+            let ifd_entries = stream.get_uint16()?;
+            if ifd_entries < 1 {
+                return Ok(false);
+            }
+
+            for tag_index in 0..ifd_entries {
+                stream.set_position(start_position + 8 + 2 + tag_index as uint64 * 12)?;
+
+                let tag_code = stream.get_uint16()? as uint32;
+                let tag_type = stream.get_uint16()? as uint32;
+                let tag_count = stream.get_uint32()?;
+                let mut tag_offset = stream.get_position();
+
+                if tag_type_size(tag_type) as uint64 * tag_count as uint64 > 4 {
+                    tag_offset = start_position + stream.get_uint32()? as uint64;
+                    stream.set_position(tag_offset)?;
+                }
+
+                // C++ ignores per-tag failures in non-validate builds (the
+                // loop just continues).
+
+                let _ = self.parse_tag(stream, 0, tag_code, tag_type, tag_count, tag_offset)?;
+            }
+
+            Ok(true)
+        })();
+
+        stream.set_big_endian(saved_endian);
+        result
     }
 }
 
@@ -856,6 +1287,40 @@ impl DngShared {
                 // Parse directly (this tag data is inline).
                 self.image_sequence_info
                     .parse_sequence_info_stream(stream, tag_count)?;
+            }
+
+            x if x == tcExtraCameraProfiles => {
+                if !check_tag_type(
+                    parent_code,
+                    tag_code,
+                    tag_type,
+                    &[ttLong as uint16, ttLong8 as uint16],
+                ) {
+                    return Ok(false);
+                }
+                if !check_tag_count(parent_code, tag_code, tag_count, 1, tag_count) {
+                    return Ok(false);
+                }
+
+                // Each entry is an absolute offset to an embedded "extended"
+                // camera-profile block (a mini TIFF directory).
+
+                for _index in 0..tag_count {
+                    let profile_offset = stream.tag_value_uint64(tag_type)?;
+
+                    let saved_position = stream.get_position();
+                    stream.set_position(profile_offset)?;
+
+                    let mut profile_info = DngCameraProfileInfo::new();
+
+                    let parsed = profile_info.parse_extended(stream)?;
+
+                    if parsed {
+                        self.extra_camera_profiles.push(profile_info);
+                    }
+
+                    stream.set_position(saved_position)?;
+                }
             }
 
             x if x == tcCameraCalibration1 => {

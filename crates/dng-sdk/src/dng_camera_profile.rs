@@ -900,19 +900,10 @@ impl DngCameraProfile {
             return false;
         }
 
-        // HueSat maps present for all three or absent for all three (when any
-        // is valid).
-        if self.hue_sat_deltas1.is_valid()
-            || self.hue_sat_deltas2.is_valid()
-            || self.hue_sat_deltas3.is_valid()
-        {
-            if self.hue_sat_deltas1.is_null()
-                || self.hue_sat_deltas2.is_null()
-                || self.hue_sat_deltas3.is_null()
-            {
-                return false;
-            }
-        }
+        // PORT-NOTE(dng_camera_profile.cpp IsValid): the C++ ends after the
+        // color-matrix invertibility checks plus the IlluminantModel()==3
+        // distinct-illuminant checks; there is deliberately no "hue-sat maps
+        // all-or-none" rule (single-map profiles are valid).
 
         true
     }
@@ -1178,11 +1169,211 @@ impl DngCameraProfile {
 
         self.apply_info(&info, shared);
 
+        // C++ dng_camera_profile::Parse re-seeks the stream at the recorded
+        // table offsets (hue-sat deltas, look table, tone curve) after the
+        // tag loop, honoring the endianness captured at parse time.
+
+        self.load_tables_from_info(stream, &info)?;
+
         Ok(true)
+    }
+
+    /// `ReadHueSatMap (stream, hueSatMap, hues, sats, vals, skipSat0)`.
+    fn read_hue_sat_map(
+        stream: &mut DngStream,
+        hue_sat_map: &mut DngHueSatMap,
+        hues: u32,
+        sats: u32,
+        vals: u32,
+        skip_sat0: bool,
+    ) -> DngResult<()> {
+        hue_sat_map.set_divisions(hues, sats, vals)?;
+
+        for val in 0..vals {
+            for hue in 0..hues {
+                for sat in if skip_sat0 { 1 } else { 0 }..sats {
+                    let hue_shift = stream.get_real32()?;
+                    let sat_scale = stream.get_real32()?;
+                    let val_scale = stream.get_real32()?;
+
+                    hue_sat_map.set_delta(
+                        hue,
+                        sat,
+                        val,
+                        HSBModify {
+                            hue_shift,
+                            sat_scale,
+                            val_scale,
+                        },
+                    )?;
+                }
+            }
+        }
+
+        hue_sat_map.assign_new_unique_runtime_fingerprint();
+
+        Ok(())
+    }
+
+    /// The C++ `Parse` tail: loads the hue-sat deltas, look table and tone
+    /// curve from the offsets captured while parsing the profile tags.
+    pub fn load_tables_from_info(
+        &mut self,
+        stream: &mut DngStream,
+        info: &dng_core::DngCameraProfileInfo,
+    ) -> DngResult<()> {
+        // Hue-sat delta tables.
+
+        for (offset, count, map) in [
+            (
+                info.hue_sat_deltas1_offset,
+                info.hue_sat_deltas1_count,
+                &mut self.hue_sat_deltas1,
+            ),
+            (
+                info.hue_sat_deltas2_offset,
+                info.hue_sat_deltas2_count,
+                &mut self.hue_sat_deltas2,
+            ),
+            (
+                info.hue_sat_deltas3_offset,
+                info.hue_sat_deltas3_count,
+                &mut self.hue_sat_deltas3,
+            ),
+        ] {
+            if offset == 0 || count == 0 {
+                continue;
+            }
+
+            let skip_sat0 = count
+                == info
+                    .profile_hues
+                    .checked_mul(info.profile_sats.wrapping_sub(1))
+                    .unwrap_or(0)
+                    .checked_mul(info.profile_vals)
+                    .unwrap_or(0)
+                    .checked_mul(3)
+                    .unwrap_or(0);
+
+            let saved_endian = stream.big_endian();
+            stream.set_big_endian(info.big_endian);
+            stream.set_position(offset)?;
+
+            let result = Self::read_hue_sat_map(
+                stream,
+                map,
+                info.profile_hues,
+                info.profile_sats,
+                info.profile_vals,
+                skip_sat0,
+            );
+
+            stream.set_big_endian(saved_endian);
+            result?;
+        }
+
+        // Look table.
+
+        if info.look_table_offset != 0 && info.look_table_count != 0 {
+            let skip_sat0 = info.look_table_count
+                == info
+                    .look_table_hues
+                    .checked_mul(info.look_table_sats.wrapping_sub(1))
+                    .unwrap_or(0)
+                    .checked_mul(info.look_table_vals)
+                    .unwrap_or(0)
+                    .checked_mul(3)
+                    .unwrap_or(0);
+
+            let saved_endian = stream.big_endian();
+            stream.set_big_endian(info.big_endian);
+            stream.set_position(info.look_table_offset)?;
+
+            let result = Self::read_hue_sat_map(
+                stream,
+                &mut self.look_table,
+                info.look_table_hues,
+                info.look_table_sats,
+                info.look_table_vals,
+                skip_sat0,
+            );
+
+            stream.set_big_endian(saved_endian);
+            result?;
+        }
+
+        // Tone curve (even float count; points = count / 2).
+
+        if info.tone_curve_count & 1 == 0 && info.tone_curve_count > 0 {
+            let points = info.tone_curve_count / 2;
+
+            if points > dng_core::dng_sdk_limits::kMaxToneCurvePoints {
+                return Err(dng_core::program_error()); // "Too many tone curve points"
+            }
+
+            let saved_endian = stream.big_endian();
+            stream.set_big_endian(info.big_endian);
+            stream.set_position(info.tone_curve_offset)?;
+
+            let mut curve = DngToneCurve::new();
+            curve.coord.clear();
+
+            let mut load_result: DngResult<()> = Ok(());
+
+            for _ in 0..points {
+                let x = match stream.get_real32() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        load_result = Err(e);
+                        break;
+                    }
+                };
+                let y = match stream.get_real32() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        load_result = Err(e);
+                        break;
+                    }
+                };
+                curve.coord.push(dng_core::DngPointReal64::new(x as real64, y as real64));
+            }
+
+            stream.set_big_endian(saved_endian);
+            load_result?;
+
+            self.set_tone_curve(&curve);
+        }
+
+        // Profile gain table map (tag tcProfileGainTableMap2): the C++ parses
+        // it inline during tag parse; the type lives in this crate, so parse
+        // from the recorded offset here.
+
+        if info.profile_gain_table_map_offset != 0 && info.profile_gain_table_map_count != 0 {
+            stream.set_position(info.profile_gain_table_map_offset)?;
+
+            let map = DngGainTableMap::get_stream_gtm(stream, true)?;
+
+            self.profile_gain_table_map = Some(map);
+        }
+
+        // Group name and dynamic-range info (plain fields on the info).
+
+        self.set_group_name(&info.profile_group_name);
+
+        if info.profile_dynamic_range.is_valid() {
+            self.dynamic_range_info = Some(info.profile_dynamic_range.clone());
+        }
+
+        // PORT-NOTE(dng_camera_profile.cpp): SetMaskedRGBTables has no
+        // counterpart field in the Rust profile yet; the captured offset is
+        // preserved on the info (masked_rgb_tables_offset).
+
+        Ok(())
     }
 
     /// Applies a parsed wire-format info block to the live profile fields.
     pub fn apply_info(&mut self, info: &dng_core::DngCameraProfileInfo, _shared: &DngShared) {
+        self.set_unique_camera_model_restriction(&info.unique_camera_model);
         self.set_name(&String::from_utf8_lossy(info.profile_name.get()));
         self.profile_calibration_signature = info.profile_calibration_signature.clone();
         self.copyright = info.profile_copyright.clone();
@@ -1560,5 +1751,217 @@ mod tests {
 
         let plain = DngString::from_bytes(b"Base");
         assert!(!has_profile_group_prefix(&plain));
+    }
+
+    /// Extended-profile block (mini TIFF directory): full parse through
+    /// parse_extended + table loading from the recorded offsets.
+    #[test]
+    fn extended_profile_block_full_parse() {
+        use dng_core::dng_tags::*;
+        use dng_core::dng_tag_types::*;
+
+        // Layout: 8-byte header ('MM' + magic), 2-byte entry count,
+        // N*12-byte entries, then >4-byte values out-of-line at
+        // start-relative offsets (the C++ extended profile format).
+
+        let mut entries: Vec<(u16, u16, u32, Option<Vec<u8>>, Option<Vec<u8>>)> = Vec::new();
+        let mut data_area: Vec<u8> = Vec::new();
+
+        // (tag, type, count, inline<=4B, out-of-line>4B)
+        entries.push((
+            tcProfileName as u16,
+            ttAscii as u16,
+            8,
+            None,
+            Some(b"TestProf\0".to_vec()),
+        ));
+
+        entries.push((
+            tcColorMatrix1 as u16,
+            ttSRational as u16,
+            9,
+            None,
+            Some({
+                let mut v = Vec::new();
+                for i in 0..9 {
+                    let (n, d) = if i == 0 || i == 4 || i == 8 {
+                        (10000i32, 10000i32)
+                    } else {
+                        (0, 1)
+                    };
+                    v.extend_from_slice(&n.to_be_bytes());
+                    v.extend_from_slice(&d.to_be_bytes());
+                }
+                v
+            }),
+        ));
+
+        entries.push((
+            tcProfileHueSatMapDims as u16,
+            ttLong as u16,
+            3,
+            None,
+            Some({
+                let mut v = Vec::new();
+                for x in [2u32, 3, 1] {
+                    v.extend_from_slice(&x.to_be_bytes());
+                }
+                v
+            }),
+        ));
+
+        entries.push((
+            tcProfileHueSatMapData1 as u16,
+            ttFloat as u16,
+            18,
+            None,
+            Some({
+                let mut v = Vec::new();
+                for i in 0..18u32 {
+                    v.extend_from_slice(&(i as f32 * 0.5).to_be_bytes());
+                }
+                v
+            }),
+        ));
+
+        entries.push((
+            tcBaselineExposureOffset as u16,
+            ttSRational as u16,
+            1,
+            None,
+            Some({
+                let mut v = Vec::new();
+                v.extend_from_slice(&1i32.to_be_bytes());
+                v.extend_from_slice(&4i32.to_be_bytes());
+                v
+            }),
+        ));
+
+        entries.push((
+            tcProfileDynamicRange as u16,
+            ttUndefined as u16,
+            8,
+            None,
+            Some({
+                let mut v = Vec::new();
+                v.extend_from_slice(&1u16.to_be_bytes());
+                v.extend_from_slice(&2u16.to_be_bytes());
+                v.extend_from_slice(&2.5f32.to_be_bytes());
+                v
+            }),
+        ));
+
+        let mut size_of = |ty: u16| -> usize {
+            match ty {
+                t if t == ttAscii as u16 || t == ttUndefined as u16 || t == ttByte as u16 => 1,
+                t if t == ttShort as u16 => 2,
+                t if t == ttLong as u16 => 4,
+                t if t == ttSRational as u16 || t == ttDouble as u16 => 8,
+                t if t == ttFloat as u16 => 4,
+                _ => panic!("unexpected type {ty}"),
+            }
+        };
+
+        // Data offsets (start-relative): base is 8 + 2 + 12*N, aligned to 4.
+        let data_base = 8 + 2 + entries.len() as u32 * 12;
+
+        let mut offsets: Vec<u32> = Vec::new();
+        {
+            let mut cursor = data_base;
+            for (tag, ty, count, inline, data) in &entries {
+                let _ = tag;
+                let total = size_of(*ty) * *count as usize;
+                if total <= 4 {
+                    offsets.push(0);
+                    let _ = inline;
+                } else {
+                    while (cursor - data_base) % 4 != 0 {
+                        data_area.push(0);
+                        cursor += 1;
+                    }
+                    offsets.push(cursor);
+                    // Write exactly count*size bytes (the C++ serializes the
+                    // tag count worth of data, never more).
+                    data_area.extend_from_slice(&data.as_ref().unwrap()[..total]);
+                    cursor += total as u32;
+                }
+            }
+        }
+
+        // Serialize.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&[0x4D, 0x4D]); // 'MM'
+        buf.extend_from_slice(&0x4352u16.to_be_bytes()); // 'CR'
+        let offset_pos = buf.len();
+        buf.extend_from_slice(&(8u32).to_be_bytes()); // IFD offset (start+8)
+        buf.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+
+        for (index, (tag, ty, count, inline, _data)) in entries.iter().enumerate() {
+            buf.extend_from_slice(&tag.to_be_bytes());
+            buf.extend_from_slice(&ty.to_be_bytes());
+            buf.extend_from_slice(&count.to_be_bytes());
+
+            let total = size_of(*ty) * *count as usize;
+            if total <= 4 {
+                let mut v = inline.clone().unwrap_or_default();
+                v.resize(4, 0);
+                buf.extend_from_slice(&v);
+            } else {
+                buf.extend_from_slice(&offsets[index].to_be_bytes());
+            }
+        }
+
+        buf.extend_from_slice(&data_area);
+
+        // Parse the extended block.
+
+        let mut stream = dng_core::DngStream::from_static(&buf, 0);
+        let mut info = dng_core::DngCameraProfileInfo::new();
+
+        assert!(info.parse_extended(&mut stream).unwrap());
+
+        // Structural fields.
+
+        assert_eq!(info.profile_name.get_str(), Some("TestProf"));
+        assert_eq!(info.color_planes, 3);
+        assert_eq!(info.color_matrix1.rows(), 3);
+        assert_eq!(info.color_matrix1.get(2, 2), 1.0);
+        assert_eq!(info.forward_matrix1.rows(), 0); // not present
+        assert_eq!(info.profile_hues, 2);
+        assert_eq!(info.profile_sats, 3);
+        assert_eq!(info.profile_vals, 1);
+        assert!(info.hue_sat_deltas1_offset != 0);
+        assert_eq!(info.hue_sat_deltas1_count, 18);
+        assert_eq!(
+            info.baseline_exposure_offset.as_real64(),
+            0.25,
+            "baseline exposure offset"
+        );
+        assert_eq!(info.profile_dynamic_range.version, 1);
+        assert_eq!(info.profile_dynamic_range.dynamic_range, 2);
+        assert_eq!(info.profile_dynamic_range.hint_max_output_value, 2.5);
+
+        // Table loading through the SDK profile.
+
+        let mut profile = DngCameraProfile::new();
+
+        profile.apply_info(&info, &dng_core::DngShared::new());
+        profile.load_tables_from_info(&mut stream, &info).unwrap();
+
+        // Hue sat map: 2*3*1 entries; entry (hue=1, sat=2, val=0) holds
+        // floats 9, 9.5, 10 (float index 1*3*3 + 2*3 + 0 = 15..17 → value
+        // 15*0.5=7.5, 8.0, 8.5).
+
+        let map = profile.hue_sat_deltas1();
+        let (h, st, v) = map.get_divisions();
+        assert_eq!((h, st, v), (2, 3, 1));
+
+        let delta = map.get_delta(1, 2, 0).unwrap();
+        assert_eq!(delta.hue_shift, 7.5);
+        assert_eq!(delta.sat_scale, 8.0);
+        assert_eq!(delta.val_scale, 8.5);
+
+        // Tone curve absent (count 0) — the profile must still be valid.
+        assert!(profile.is_valid(3));
     }
 }

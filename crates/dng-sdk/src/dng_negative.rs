@@ -4365,6 +4365,7 @@ impl DngNegative {
                     // phase-3 integration (see PORTING_NOTES).
 
                     profile.apply_info(&shared.camera_profile, &shared);
+                    profile.load_tables_from_info(stream, &shared.camera_profile)?;
 
                     // The main embedded profile must be valid.
 
@@ -4384,6 +4385,7 @@ impl DngNegative {
                         let mut profile = DngCameraProfile::new();
 
                         profile.apply_info(profile_info, &shared);
+                        profile.load_tables_from_info(stream, profile_info)?;
 
                         if !profile.is_valid(shared.camera_profile.color_planes) {
                             return Err(dng_core::bad_format());
