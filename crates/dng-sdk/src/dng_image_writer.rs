@@ -41,7 +41,7 @@ use dng_core::dng_stream::DngStream;
 use dng_core::dng_string::DngString;
 use dng_core::dng_tag_types::{ttByte, ttFloat, ttLong, ttShort, ttUndefined};
 use dng_core::dng_tag_values::{
-    ccDeflate, ccJXL, ccJPEG, ccLossyJPEG, ccUncompressed, cpFloatingPoint,
+    ccDeflate, ccJXL, ccJPEG, ccLossyJPEG, ccUncompressed, cpFloatingPoint, sfPreviewImage,
     cpHorizontalDifference, cpNullPredictor, pcInterleaved, sfFloatingPoint,
     sfUnsignedInteger, dngVersion_1_1_0_0, dngVersion_1_4_0_0, dngVersion_1_5_0_0,
     dngVersion_1_6_0_0, dngVersion_1_7_0_0,
@@ -243,6 +243,71 @@ pub fn encode_lossless(
 
 /// Deflate-encode raw samples (zlib wrapper, matching the SDK's zlib use).
 #[allow(dead_code)]
+/// `EncodeDeltaBytes` (dng_image_writer.cpp:3553) — backward per-lane byte
+/// deltas.
+fn encode_delta_bytes(buf: &mut [uint8], cols: int32, channels: int32) {
+    let channels = channels as usize;
+    let cols = cols as usize;
+
+    // Walk backward: buf[i] -= buf[i - channels], lanes of stride `channels`.
+
+    for lane in 0..channels {
+        for i in (0..cols).rev() {
+            let pos = i * channels + lane;
+            if pos >= channels {
+                let prev = buf[pos - channels];
+                buf[pos] = buf[pos].wrapping_sub(prev);
+            }
+        }
+    }
+}
+
+/// `EncodeFPDelta` (dng_image_writer.cpp:3636) — little-endian byte-plane
+/// split followed by `EncodeDeltaBytes`.
+fn encode_fp_delta(
+    interleaved: &[uint8],
+    cols: usize,
+    channels: usize,
+    bytes_per_sample: usize,
+) -> Vec<uint8> {
+    let row_increment = cols * channels;
+
+    let mut temp = vec![0u8; row_increment * bytes_per_sample];
+
+    // Little-endian host byte order mapping (qDNGBigEndian branch reversed):
+    // the least-significant byte plane comes last in `temp`.
+    for col in 0..row_increment {
+        let src = &interleaved[col * bytes_per_sample..(col + 1) * bytes_per_sample];
+
+        match bytes_per_sample {
+            2 => {
+                temp[row_increment + col] = src[0]; // dst0? see C++: dst1 = temp
+                temp[col] = src[1];
+            }
+            3 => {
+                temp[col] = src[0];
+                temp[row_increment + col] = src[1];
+                temp[row_increment * 2 + col] = src[2];
+            }
+            _ => {
+                // dst3 = temp, dst2 = temp + r, dst1 = temp + 2r, dst0 = temp + 3r
+                temp[row_increment * 3 + col] = src[0];
+                temp[row_increment * 2 + col] = src[1];
+                temp[row_increment + col] = src[2];
+                temp[col] = src[3];
+            }
+        }
+    }
+
+    encode_delta_bytes(
+        &mut temp,
+        (cols * bytes_per_sample) as int32,
+        channels as int32,
+    );
+
+    temp
+}
+
 fn encode_deflate(data: &[uint8]) -> DngResult<Vec<uint8>> {
     dng_core::zlib::compress(data, -1)
 }
@@ -1019,6 +1084,13 @@ impl DngImageWriter {
 
         // SubIFDs + ExifIFD linkage.
 
+        // IFD0 acts as the metadata/preview directory (C++ marks it as the
+        // preview image when the raw data lives in a SubIFD).
+        main_ifd.add(Box::new(TagUint32::new(
+            tcNewSubFileType as uint16,
+            sfPreviewImage,
+        )));
+
         main_ifd.add(Box::new(u64s_tag(tcSubIFDs, vec![raw_ifd_offset])));
 
         if has_exif {
@@ -1132,6 +1204,16 @@ impl DngImageWriter {
             encode_count as uint64,
         )?;
 
+        // The SubIFDs / ExifIFD values in IFD0 were written with provisional
+        // offsets (the tags grow IFD0 after sizing) — patch them to the
+        // final layout, like the C++ mutable tags.
+
+        patch_offset_in_ifd(stream, ifd0_offset, tcSubIFDs, raw_ifd_offset)?;
+
+        if has_exif {
+            patch_offset_in_ifd(stream, ifd0_offset, tcExifIFD, exif_ifd_offset)?;
+        }
+
         stream.flush()?;
 
         Ok(())
@@ -1171,45 +1253,46 @@ impl DngImageWriter {
             }
 
             x if x == ccDeflate => {
-                // Deflate with the horizontal / float predictor applied.
+                // Deflate with the horizontal / float predictor applied. The
+                // whole (predictor-encoded) tile goes through a single zlib
+                // stream, like the C++ WriteTile.
 
                 let mut raw: Vec<uint8> = Vec::new();
 
                 if image.pixel_type() == ttFloat {
+                    // cpFloatingPoint predictor: the C++ EncodeFPDelta splits
+                    // each row into little-endian byte planes and then
+                    // byte-deltas each lane backward (EncodeDeltaBytes).
+
                     let floats = image_samples_f32(image, bounds)?;
 
-                    // cpFloatingPoint predictor: delta-encode bytes per row,
-                    // big-endian byte order per sample (the C++ float
-                    // predictor is byte-order independent and stores
-                    // big-endian).
-
                     let cols = bounds.w() as usize * image.planes() as usize;
-
                     let bytes_per_sample = 4usize;
 
                     for row in 0..bounds.h() as usize {
                         let base = row * cols;
 
-                        let mut prev: Vec<u8> = vec![0; cols * bytes_per_sample];
+                        let mut row_bytes =
+                            Vec::with_capacity(cols * bytes_per_sample);
 
                         for col in 0..cols {
-                            let bits = floats[base + col].to_bits().to_be_bytes();
-
-                            for b in 0..bytes_per_sample {
-                                let delta = bits[b].wrapping_sub(prev[col * bytes_per_sample + b]);
-
-                                raw.push(delta);
-
-                                prev[col * bytes_per_sample + b] = bits[b];
-                            }
+                            row_bytes
+                                .extend_from_slice(&floats[base + col].to_le_bytes());
                         }
+
+                        raw.extend_from_slice(&encode_fp_delta(
+                            &row_bytes,
+                            bounds.w() as usize,
+                            image.planes() as usize,
+                            bytes_per_sample,
+                        ));
                     }
                 } else {
+                    // cpHorizontalDifference (16-bit): delta vs the previous
+                    // sample in the row (LE).
+
                     let samples = image_samples_u16(image, bounds)?;
-
                     let cols = bounds.w() as usize * image.planes() as usize;
-
-                    // cpHorizontalDifference predictor (16-bit).
 
                     for row in 0..bounds.h() as usize {
                         let base = row * cols;
@@ -1218,16 +1301,13 @@ impl DngImageWriter {
 
                         for col in 0..cols {
                             let delta = samples[base + col].wrapping_sub(prev);
-
                             raw.extend_from_slice(&delta.to_le_bytes());
-
                             prev = samples[base + col];
                         }
                     }
                 }
 
                 let compressed = encode_deflate(&raw)?;
-
                 stream.put(&compressed)?;
             }
 
@@ -1584,6 +1664,189 @@ mod tests {
 
         assert_eq!(version[0], 0x01);
         assert_eq!(version[1], 0x04);
+    }
+
+    /// Fill a single-channel u16 image with a deterministic pattern.
+    fn fill_u16_image(image: &ImageRef, width: u32, height: u32) {
+        for row in 0..height as int32 {
+            for col in 0..width as int32 {
+                let value = (((row as uint32) * width + col as uint32) * 997 % 65535) as uint16;
+
+                let mut buffer = DngPixelBuffer::with_planar_config(
+                    DngRect::from_corners(row, col, row + 1, col + 1),
+                    0,
+                    1,
+                    ttShort,
+                    pcInterleaved,
+                    PixelData::U16(vec![value]),
+                )
+                .unwrap();
+
+                image.read().unwrap().do_put(&buffer).unwrap();
+            }
+        }
+    }
+
+    fn expected_u16(row: int32, col: int32, width: u32) -> uint16 {
+        (((row as uint32) * width + col as uint32) * 997 % 65535) as uint16
+    }
+
+    /// Full write -> re-parse -> read_stage1_image -> pixel-compare cycle.
+    fn round_trip_compressed(pixel_type: uint32, forced_lossy_code: Option<uint32>) {
+        let mut host = DngHost::new();
+
+        let width = 8;
+        let height = 6;
+
+        let bounds = DngRect::from_size_point(DngPoint::new(height as int32, width as int32));
+
+        let image: ImageRef = DngSimpleImage::new(bounds, 1, pixel_type)
+            .unwrap()
+            .into_image_ref()
+            .unwrap();
+
+        match pixel_type {
+            t if t == ttShort => fill_u16_image(&image, width, height),
+            t if t == ttFloat => {
+                for row in 0..height as int32 {
+                    for col in 0..width as int32 {
+                        let v = ((row * width as int32 + col) as f32) * 0.25 - 1.0;
+                        let mut buffer = DngPixelBuffer::with_planar_config(
+                            DngRect::from_corners(row, col, row + 1, col + 1),
+                            0,
+                            1,
+                            ttFloat,
+                            pcInterleaved,
+                            PixelData::F32(vec![v]),
+                        )
+                        .unwrap();
+                        image.read().unwrap().do_put(&buffer).unwrap();
+                    }
+                }
+            }
+            _ => panic!("unsupported pixel type"),
+        }
+
+        let mut negative = DngNegative::new(&mut host).unwrap();
+
+        negative.set_stage3_image(Some(image));
+        negative.set_default_crop_size_u32(width, height);
+
+        if let Some(code) = forced_lossy_code {
+            let lossy = crate::dng_jpeg_image::DngLossyCompressedImage {
+                compression_code: code,
+                image_size: DngPoint::new(width as int32, height as int32),
+                tile_size: DngPoint::new(width as int32, height as int32),
+                uses_strips: true,
+                bits_per_sample: 16,
+                row_interleave_factor: 1,
+                column_interleave_factor: 1,
+                jxl_distance: 0.0,
+                jxl_effort: 7,
+                ..Default::default()
+            };
+            negative.set_raw_lossy_compressed_image(Some(Box::new(lossy)));
+        }
+
+        // Write the DNG (compressed).
+
+        let mut stream = DngMemoryStream::new().stream();
+        stream.set_big_endian(false);
+
+        let mut writer = DngImageWriter::new();
+
+        writer
+            .write_dng(&mut host, &mut stream, &mut negative, dngVersion_1_4_0_0, false, false)
+            .unwrap();
+
+        stream.flush().unwrap();
+
+        // Re-read the bytes.
+
+        stream.set_read_position(0).unwrap();
+
+        let length = stream.length() as uint32;
+        let bytes = stream.get(length).unwrap();
+
+        let mut stream = dng_core::DngStream::from_static(&bytes, 0);
+        stream.set_big_endian(false);
+
+        // Full parse pipeline.
+
+        let mut info = crate::dng_info::DngInfo::new();
+
+        info.parse(&mut host, &mut stream).unwrap();
+        info.post_parse(&mut host).unwrap();
+
+        assert!(info.is_valid_dng(), "re-parsed DNG must be valid");
+
+        let mut re_negative = DngNegative::new(&mut host).unwrap();
+
+        re_negative.parse(&mut host, &mut stream, &mut info).unwrap();
+        re_negative
+            .post_parse(&mut host, &mut stream, &mut info)
+            .unwrap();
+
+        re_negative
+            .read_stage1_image(&mut host, &mut stream, &mut info)
+            .unwrap();
+
+        // Compare pixels bit-exact.
+
+        let stage1 = re_negative.stage1_image().expect("stage1 image").clone();
+        let img = stage1.read().unwrap();
+
+        assert_eq!(img.width(), width);
+        assert_eq!(img.height(), height);
+
+        let mut buf = DngPixelBuffer::with_planar_config(
+            img.bounds(),
+            0,
+            1,
+            pixel_type,
+            pcInterleaved,
+            DngPixelBuffer::allocate_data(img.bounds(), 1, pixel_type).unwrap(),
+        )
+        .unwrap();
+
+        img.do_get(&mut buf).unwrap();
+
+        for row in 0..height as int32 {
+            for col in 0..width as int32 {
+                match pixel_type {
+                    t if t == ttShort => {
+                        let v = buf.const_pixel_u16(row, col, 0).unwrap();
+                        assert_eq!(v, expected_u16(row, col, width), "u16 at {row},{col}");
+                    }
+                    t if t == ttFloat => {
+                        let v = buf.const_pixel_f32(row, col, 0).unwrap();
+                        let expected = ((row * width as int32 + col) as f32) * 0.25 - 1.0;
+                        assert!((v - expected).abs() < 1e-6, "f32 at {row},{col}: {v} vs {expected}");
+                    }
+                    _ => panic!("unsupported"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_write_dng_lossless_jpeg_round_trip() {
+        // u16 integer + uncompressed=false selects ccJPEG, which the writer
+        // encodes with the SDK's lossless JPEG encoder (like the C++).
+        round_trip_compressed(ttShort, None);
+    }
+
+    #[test]
+    fn test_write_dng_deflate_float_round_trip() {
+        // f32 + uncompressed=false selects ccDeflate with the float
+        // byte-wise delta predictor.
+        round_trip_compressed(ttFloat, None);
+    }
+
+    #[test]
+    fn test_write_dng_jxl_round_trip() {
+        // A captured lossy code of ccJXL forces the JXL write path.
+        round_trip_compressed(ttFloat, Some(ccJXL));
     }
 
     /// `min_backward_version_for_compression` semantics.

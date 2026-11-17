@@ -1405,6 +1405,27 @@ impl DngIfd {
             _ => return false,
         }
 
+        // Predictor combination check (C++ dng_ifd.cpp, after the
+        // compression switch).
+
+        if is_floating_point
+            && self.compression == ccDeflate
+            && (self.predictor == cpFloatingPoint
+                || self.predictor == cpFloatingPointX2
+                || self.predictor == cpFloatingPointX4)
+        {
+            // Supported combination.
+        } else if !is_floating_point
+            && self.compression == ccDeflate
+            && (self.predictor == cpHorizontalDifference
+                || self.predictor == cpHorizontalDifferenceX2
+                || self.predictor == cpHorizontalDifferenceX4)
+        {
+            // Supported combination.
+        } else if self.predictor != cpNullPredictor {
+            return { let _x = 1; false };
+        }
+
         // Check ImageWidth and ImageLength.
         if self.image_width < 1 || self.image_length < 1 {
             return { let _x = 1; false };
@@ -1577,36 +1598,10 @@ impl DngIfd {
                 }
             }
             x if x == ccDeflate => {
-                if !is_floating_point
-                    && !is_gain_map_ifd
-                    && self.bits_per_sample[0] != 32
-                    && self.bits_per_sample[0] != 16
-                    && self.bits_per_sample[0] != 8
-                {
-                    return { let _x = 1; false };
-                }
-                if is_floating_point
-                    && self.predictor != cpFloatingPoint
-                    && self.predictor != cpFloatingPointX2
-                    && self.predictor != cpFloatingPointX4
-                    && self.predictor != cpNullPredictor
-                {
-                    return { let _x = 1; false };
-                }
-                if !is_floating_point
-                    && self.compression == ccDeflate
-                    && (self.predictor == cpHorizontalDifference
-                        || self.predictor == cpHorizontalDifferenceX2
-                        || self.predictor == cpHorizontalDifferenceX4)
-                {
-                    // Supported combination.
-                } else if self.predictor != cpNullPredictor
-                    && self.predictor != cpHorizontalDifference
-                    && self.predictor != cpHorizontalDifferenceX2
-                    && self.predictor != cpHorizontalDifferenceX4
-                {
-                    return { let _x = 1; false };
-                }
+                // C++ (dng_ifd.cpp): the bits-per-sample exception here is a
+                // qDNGValidate-only warning, not a parse failure. The
+                // predictor combination check lives after the compression
+                // switch (see below).
             }
             x if x == ccLZW => {
                 if is_floating_point {

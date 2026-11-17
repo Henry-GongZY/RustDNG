@@ -2341,7 +2341,6 @@ impl DngInfo {
             } else {
                 tcFirstSubIFD + index - 1
             };
-
             if !self.ifd[index as usize].is_valid_dng(&self.shared, parent_code) {
                 // Only errors in the main and transparency mask IFDs are
                 // fatal to parsing.
