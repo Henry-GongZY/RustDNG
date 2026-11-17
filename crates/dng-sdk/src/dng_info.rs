@@ -260,9 +260,6 @@ impl DngInfo {
             // Some TIFF file writers forget about the next IFD offset, so
             // validate the IFD at that offset before parsing it.
 
-            #[cfg(test)]
-            eprintln!("CHAIN-DIAG next_offset={} len={} ok={}", next_offset, stream.length(),
-                self.validate_ifd(stream, self.tiff_block_offset + next_offset, self.tiff_block_offset as int64)?);
             if !self.validate_ifd(
                 stream,
                 self.tiff_block_offset + next_offset,
