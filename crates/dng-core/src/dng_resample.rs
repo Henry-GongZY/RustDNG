@@ -590,7 +590,7 @@ impl DngAreaTask for DngResampleTask {
     }
 
     fn process(
-        &mut self,
+        &self,
         _thread_index: uint32,
         area: DngRect,
         _sniffer: Option<&std::sync::Arc<dyn crate::dng_abort_sniffer::AbortSniffer>>,

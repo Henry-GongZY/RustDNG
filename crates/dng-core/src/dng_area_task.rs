@@ -91,8 +91,13 @@ pub trait DngAreaTask: Send + Sync {
     }
 
     /// `Process (threadIndex, tile, sniffer)` — the per-tile work.
+    ///
+    /// Takes `&self` so the threaded driver can share one task across
+    /// worker threads (images are `ImageRef` handles; per-task accumulators
+    /// must use interior mutability). Note the stock C++ host runs tasks
+    /// serially (`PerformAreaTaskThreads () == 1`); threading is opt-in.
     fn process(
-        &mut self,
+        &self,
         thread_index: uint32,
         tile: DngRect,
         sniffer: Option<&Arc<dyn crate::dng_abort_sniffer::AbortSniffer>>,
@@ -172,7 +177,7 @@ pub trait DngAreaTask: Send + Sync {
     /// the exact C++ tile decomposition (nested RepeatingTile3/2/1 then
     /// tileSize iteration).
     fn process_on_thread(
-        &mut self,
+        &self,
         thread_index: uint32,
         area: DngRect,
         tile_size: DngPoint,
@@ -258,6 +263,101 @@ pub fn perform_area_task(
     task.finish(1);
 
     Ok(())
+}
+
+/// Threaded variant: splits `area` into horizontal bands (tile-aligned) and
+/// processes them on worker threads sharing one task object (`&self`).
+///
+/// The stock C++ host runs tasks serially (`PerformAreaTaskThreads () == 1`);
+/// this is an opt-in acceleration mirroring what threaded host subclasses do
+/// in C++.
+pub fn perform_area_task_threaded(
+    task: &mut dyn DngAreaTask,
+    area: DngRect,
+    sniffer: Option<&Arc<dyn crate::dng_abort_sniffer::AbortSniffer>>,
+    progress: Option<&dyn DngAreaTaskProgress>,
+    requested_threads: uint32,
+) -> DngResult<()> {
+    let thread_count = requested_threads.max(1).min(task.max_threads().max(1));
+
+    let tile_size = task.find_tile_size(area);
+
+    task.start(thread_count, area, tile_size, sniffer)?;
+
+    if thread_count <= 1 {
+        task.process_on_thread(0, area, tile_size, sniffer, progress)?;
+
+        task.finish(1);
+
+        return Ok(());
+    }
+
+    // `start`/`finish` run serially; the tile loop shares the task via an
+    // immutable borrow.
+
+    let task_ref: &dyn DngAreaTask = task;
+
+    // Horizontal band split, aligned to the tile height so tiles do not
+    // straddle band boundaries.
+
+    let align = tile_size.v.max(1);
+    let height = area.h();
+    let band = ((height as f64) / (thread_count as f64)).ceil() as int32;
+    let band = ((band / align) * align).max(align);
+
+    let errors: &std::sync::Mutex<Vec<crate::dng_errors::DngError>> =
+        &std::sync::Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        let mut t = area.t;
+
+        let mut index = 0u32;
+
+        while t < area.b {
+            let mut b = (t + band).min(area.b);
+
+            if b < area.b {
+                // Align interior band edges down to a tile boundary.
+                b = area.t + ((b - area.t) / align) * align;
+            }
+
+            let band_rect = DngRect::from_corners(t, area.l, b.max(t + 1), area.r);
+
+            let sniffer = sniffer.cloned();
+
+            let handle = scope.spawn(move || {
+                let result =
+                    task_ref.process_on_thread(index, band_rect, tile_size, sniffer.as_ref(), progress);
+
+                if let Err(err) = result {
+                    errors.lock().unwrap().push(err);
+                }
+                let _ = &errors;
+            });
+
+            let _ = handle;
+
+            t = b;
+            index += 1;
+        }
+    });
+
+    let mut first_error: Option<crate::dng_errors::DngError> = None;
+
+    {
+        let collected = errors.lock().unwrap().clone();
+
+        if let Some(err) = collected.into_iter().next() {
+            first_error = Some(err);
+        }
+    }
+
+    task.finish(thread_count);
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +569,7 @@ mod tests {
         }
 
         fn process(
-            &mut self,
+            &self,
             _thread_index: uint32,
             tile: DngRect,
             _sniffer: Option<&Arc<dyn crate::dng_abort_sniffer::AbortSniffer>>,
@@ -550,7 +650,7 @@ mod tests {
     fn find_tile_size_respects_max() {
         struct BigTask;
         impl DngAreaTask for BigTask {
-            fn process(&mut self, _: uint32, _: DngRect, _: Option<&Arc<dyn crate::dng_abort_sniffer::AbortSniffer>>) -> DngResult<()> {
+            fn process(&self, _: uint32, _: DngRect, _: Option<&Arc<dyn crate::dng_abort_sniffer::AbortSniffer>>) -> DngResult<()> {
                 Ok(())
             }
             fn max_tile_size(&self) -> DngPoint {
@@ -575,5 +675,106 @@ mod tests {
             task.run().unwrap();
         }
         assert_eq!(collected, vec![(0, 10)]);
+    }
+    /// Threaded vs serial determinism: a band-split fill task must produce
+    /// the same image contents either way.
+    #[test]
+    fn threaded_perform_matches_serial() {
+        use crate::dng_image::{ImageRef};
+        use crate::dng_pixel_buffer::{DngPixelBuffer, PixelData};
+        use crate::dng_simple_image::DngSimpleImage;
+        use crate::dng_tag_types::ttShort;
+
+        struct FillTask {
+            image: ImageRef,
+        }
+
+        impl DngAreaTask for FillTask {
+            fn process(
+                &self,
+                _thread_index: uint32,
+                tile: DngRect,
+                _: Option<&Arc<dyn crate::dng_abort_sniffer::AbortSniffer>>,
+            ) -> DngResult<()> {
+                for row in tile.t..tile.b {
+                    for col in tile.l..tile.r {
+                        let value = (row as uint32 * 31 + col as uint32 * 7) as u16 % 512;
+
+                        let mut buffer = DngPixelBuffer::with_planar_config(
+                            DngRect::from_corners(row, col, row + 1, col + 1),
+                            0,
+                            1,
+                            ttShort,
+                            crate::dng_tag_values::pcInterleaved,
+                            PixelData::U16(vec![value as u16]),
+                        )
+                        .unwrap();
+
+                        self.image.read().unwrap().do_put(&buffer).unwrap();
+                    }
+                }
+
+                Ok(())
+            }
+        }
+
+        let width = 40u32;
+        let height = 30u32;
+
+        let bounds = DngRect::from_corners(0, 0, height as int32, width as int32);
+
+        // Serial run.
+        let serial: ImageRef = DngSimpleImage::new(bounds, 1, ttShort)
+            .unwrap()
+            .into_image_ref()
+            .unwrap();
+
+        {
+            let mut task = FillTask {
+                image: serial.clone(),
+            };
+
+            perform_area_task(&mut task, bounds, None, None).unwrap();
+        }
+
+        // Threaded run (4 threads over 30 rows -> band aligned to tiles).
+        let threaded: ImageRef = DngSimpleImage::new(bounds, 1, ttShort)
+            .unwrap()
+            .into_image_ref()
+            .unwrap();
+
+        {
+            let mut task = FillTask {
+                image: threaded.clone(),
+            };
+
+            perform_area_task_threaded(&mut task, bounds, None, None, 4).unwrap();
+        }
+
+        // Compare.
+
+        let s = serial.read().unwrap();
+        let t = threaded.read().unwrap();
+
+        let mut s_buf = DngPixelBuffer::with_planar_config(
+            bounds, 0, 1, ttShort, crate::dng_tag_values::pcInterleaved,
+            DngPixelBuffer::allocate_data(bounds, 1, ttShort).unwrap(),
+        )
+        .unwrap();
+
+        s.do_get(&mut s_buf).unwrap();
+
+        let mut t_buf = DngPixelBuffer::with_planar_config(
+            bounds, 0, 1, ttShort, crate::dng_tag_values::pcInterleaved,
+            DngPixelBuffer::allocate_data(bounds, 1, ttShort).unwrap(),
+        )
+        .unwrap();
+
+        t.do_get(&mut t_buf).unwrap();
+
+        assert_eq!(
+            s_buf.as_u16_slice().unwrap(),
+            t_buf.as_u16_slice().unwrap()
+        );
     }
 }

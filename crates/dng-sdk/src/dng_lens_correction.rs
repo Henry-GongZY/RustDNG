@@ -1147,7 +1147,7 @@ impl DngAreaTask for DngFilterWarp {
     }
 
     fn process(
-        &mut self,
+        &self,
         _thread_index: uint32,
         dst_area: DngRect,
         _sniffer: Option<&std::sync::Arc<dyn dng_core::dng_abort_sniffer::AbortSniffer>>,

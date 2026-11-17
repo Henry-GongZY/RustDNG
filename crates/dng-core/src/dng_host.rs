@@ -29,6 +29,9 @@ use std::sync::Arc;
 pub struct DngHost {
     sniffer: Option<Arc<dyn crate::dng_abort_sniffer::AbortSniffer>>,
 
+    /// Opt-in threaded area tasks (stock C++ host returns 1).
+    perform_area_task_threads: uint32,
+
     needs_meta: bool,
     needs_image: bool,
     for_preview: bool,
@@ -65,6 +68,7 @@ impl DngHost {
     pub fn new() -> Self {
         DngHost {
             sniffer: None,
+            perform_area_task_threads: 1,
             needs_meta: true,
             needs_image: true,
             for_preview: false,
@@ -303,12 +307,33 @@ impl DngHost {
         area: DngRect,
     ) -> DngResult<()> {
         let sniffer = self.sniffer.clone();
-        crate::dng_area_task::perform_area_task(task, area, sniffer.as_ref(), None)
+
+        let threads = self.perform_area_task_threads();
+
+        if threads > 1 {
+            crate::dng_area_task::perform_area_task_threaded(
+                task,
+                area,
+                sniffer.as_ref(),
+                None,
+                threads,
+            )
+        } else {
+            crate::dng_area_task::perform_area_task(task, area, sniffer.as_ref(), None)
+        }
     }
 
-    /// `PerformAreaTaskThreads ()` — always 1 in the serial port.
+    /// `PerformAreaTaskThreads ()` — 1 by default, matching the stock C++
+    /// host (dng_host.cpp returns 1). Embedders may opt into threading via
+    /// `set_perform_area_task_threads`.
     pub fn perform_area_task_threads(&self) -> uint32 {
-        1
+        self.perform_area_task_threads
+    }
+
+    /// Opt-in threaded area tasks (`PerformAreaTaskThreads () == N` in C++
+    /// threaded host subclasses).
+    pub fn set_perform_area_task_threads(&mut self, threads: uint32) {
+        self.perform_area_task_threads = threads.max(1);
     }
 }
 

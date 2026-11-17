@@ -6784,7 +6784,7 @@ struct DngFindNewRawImageDigestTask {
 
     tile_count: uint32,
 
-    tile_hash: Vec<DngFingerprint>,
+    tile_hash: std::sync::Mutex<Vec<DngFingerprint>>,
 
     unit_cell: DngPoint,
 }
@@ -6806,7 +6806,7 @@ impl DngFindNewRawImageDigestTask {
             tiles_across: 0,
             tiles_down: 0,
             tile_count: 0,
-            tile_hash: Vec::new(),
+            tile_hash: std::sync::Mutex::new(Vec::new()),
             unit_cell,
         }
     }
@@ -6815,8 +6815,10 @@ impl DngFindNewRawImageDigestTask {
     fn result(&self) -> DngResult<DngFingerprint> {
         let mut printer = DngMd5Printer::new();
 
+        let tile_hash = self.tile_hash.lock().unwrap();
+
         for tile_index in 0..self.tile_count as usize {
-            printer.process(&self.tile_hash[tile_index].data);
+            printer.process(&tile_hash[tile_index].data);
         }
 
         Ok(*printer.result())
@@ -6860,13 +6862,14 @@ impl DngAreaTask for DngFindNewRawImageDigestTask {
 
         self.tile_count = self.tiles_across * self.tiles_down;
 
-        self.tile_hash = vec![DngFingerprint::new(); self.tile_count as usize];
+        *self.tile_hash.lock().unwrap() =
+            vec![DngFingerprint::new(); self.tile_count as usize];
 
         Ok(())
     }
 
     fn process(
-        &mut self,
+        &self,
         _thread_index: uint32,
         tile: DngRect,
         _sniffer: Option<&std::sync::Arc<dyn dng_core::dng_abort_sniffer::AbortSniffer>>,
@@ -6910,7 +6913,7 @@ impl DngAreaTask for DngFindNewRawImageDigestTask {
 
         printer.process(&bytes);
 
-        self.tile_hash[tile_index as usize] = *printer.result();
+        self.tile_hash.lock().unwrap()[tile_index as usize] = *printer.result();
 
         Ok(())
     }
@@ -7152,7 +7155,7 @@ impl DngAreaTask for DngEncodeProxyTask {
     }
 
     fn process(
-        &mut self,
+        &self,
         _thread_index: uint32,
         tile: DngRect,
         _sniffer: Option<&std::sync::Arc<dyn dng_core::dng_abort_sniffer::AbortSniffer>>,

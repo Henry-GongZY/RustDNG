@@ -864,14 +864,14 @@ impl DngAreaTask for DngLinearizeImage {
     }
 
     fn process(
-        &mut self,
+        &self,
         _thread_index: uint32,
         src_tile: DngRect,
         _sniffer: Option<&std::sync::Arc<dyn dng_core::dng_abort_sniffer::AbortSniffer>>,
     ) -> DngResult<()> {
         // Process each plane.
 
-        for plane_task in self.plane_tasks.iter_mut() {
+        for plane_task in self.plane_tasks.iter() {
             if let Some(task) = plane_task {
                 task.process(&self.src_image, &self.dst_image, src_tile)?;
             }

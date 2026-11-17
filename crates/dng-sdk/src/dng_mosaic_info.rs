@@ -938,7 +938,7 @@ impl DngFastInterpolator {
 
     /// `ProcessArea (threadIndex, srcBuffer, dstBuffer)`.
     fn process_area(
-        &mut self,
+        &self,
         _thread_index: uint32,
         src_buffer: &mut DngPixelBuffer,
         dst_buffer: &mut DngPixelBuffer,
@@ -1071,7 +1071,7 @@ impl DngAreaTask for DngFastInterpolator {
     }
 
     fn process(
-        &mut self,
+        &self,
         thread_index: uint32,
         area: DngRect,
         _sniffer: Option<&std::sync::Arc<dyn dng_core::dng_abort_sniffer::AbortSniffer>>,

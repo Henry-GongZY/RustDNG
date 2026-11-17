@@ -1106,7 +1106,7 @@ impl crate::dng_area_task::DngAreaTask for DngLimitFloatDepthTask {
     }
 
     fn process(
-        &mut self,
+        &self,
         _thread_index: uint32,
         tile: DngRect,
         _sniffer: Option<&std::sync::Arc<dyn crate::dng_abort_sniffer::AbortSniffer>>,

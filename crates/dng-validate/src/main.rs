@@ -31,6 +31,7 @@ struct Options {
     verbose: bool,
     no_stages: bool,
     render: bool,
+    threads: u32,
     files: Vec<String>,
 }
 
@@ -53,6 +54,11 @@ fn validate_file(options: &Options, path: &str) -> dng_core::DngResult<()> {
     println!("\n===> {} <===", path);
 
     let mut host = DngHost::new();
+
+    if options.threads > 1 {
+        host.set_perform_area_task_threads(options.threads);
+        println!("Threading: {} worker threads", options.threads);
+    }
     let mut stream = DngFileStream::open_read(Path::new(path))?;
 
     // info.Parse / info.PostParse / info.IsValidDNG.
@@ -174,6 +180,7 @@ fn main() {
         verbose: false,
         no_stages: false,
         render: false,
+        threads: 1,
         files: Vec::new(),
     };
 
@@ -184,6 +191,10 @@ fn main() {
             "-v" | "--verbose" => options.verbose = true,
             "--no-stages" => options.no_stages = true,
             "--render" => options.render = true,
+            "--threads" => {
+                let v = args.next().unwrap_or_default();
+                options.threads = v.parse().unwrap_or(1);
+            }
             "-h" | "--help" => std::process::exit(print_usage()),
             other => options.files.push(other.to_string()),
         }
