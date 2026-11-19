@@ -1010,6 +1010,7 @@ pub fn histogram_area(
 
     let need = (max_value as usize + 1) * std::mem::size_of::<uint32>();
     if hist.len() * std::mem::size_of::<uint32>() < need {
+        eprintln!("HIST-DIAG len={} need={}", hist.len(), need);
         return Err(program_error());
     }
     for v in hist.iter_mut() {
@@ -1022,24 +1023,19 @@ pub fn histogram_area(
     while iter.get_one_tile(&mut tile)? {
         let buffer = crate::dng_image::DngConstTileBuffer::new(image, tile)?;
 
-        let mut row = tile.t;
-        let mut col = tile.l;
+        // const_pixel_u16 takes pixel coordinates; the C++ walks raw
+        // pointers with element steps, which the pixel-coordinate API must
+        // not mix in.
 
-        let row_step = buffer.row_step();
-        let col_step = buffer.col_step();
-
-        for _r in 0..tile.h() {
-            let mut c = col;
-            for _cc in 0..tile.w() {
-                let x = buffer.const_pixel_u16(row, c, plane)? as uint32;
+        for row in tile.t..tile.b {
+            for col in tile.l..tile.r {
+                let x = buffer.const_pixel_u16(row, col, plane)? as uint32;
                 if max_value == 0x0FFFF {
                     hist[x as usize] += 1;
                 } else if x <= max_value {
                     hist[x as usize] += 1;
                 }
-                c += col_step;
             }
-            row += row_step;
         }
     }
 

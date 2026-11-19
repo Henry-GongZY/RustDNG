@@ -59,12 +59,13 @@ use dng_core::dng_sdk_limits::{
     kMaxColorPlanes, kMaxMaskedAreas, kMaxStage3BlackLevelNormalized, kMaxSemanticMasks,
 };
 use dng_core::dng_simple_image::DngSimpleImage;
-use dng_core::dng_tag_types::{tag_type_size, ttByte, ttFloat, ttLong, ttShort};
+use dng_core::dng_tag_types::{tag_type_size, ttByte, ttFloat, ttLong, ttShort, ttHalfFloat };
 use dng_core::dng_tag_values::{
     colorKeyBlue, colorKeyCyan, colorKeyGreen, colorKeyMaxEnum, colorKeyMagenta, colorKeyRed,
     colorKeyYellow, crSceneReferred, depthFormatUnknown, depthMeasureUnknown, depthUnitsUnknown,
     sfFloatingPoint,
 };
+use dng_core::dng_tag_values::{ccDeflate, ccJXL, piLinearRaw, pcInterleaved};
 use dng_core::dng_utils::{histogram_area, DngDither, DngImageSequenceInfo, DngImageStats};
 use dng_core::{DngXyCoord, kDNGStreamInvalidOffset};
 
@@ -76,7 +77,7 @@ use crate::dng_camera_profile::{
 };
 use crate::dng_exif::DngExif;
 use crate::dng_info::DngInfo;
-use crate::dng_jpeg_image::{keep_lossy_compressed_image, DngLossyCompressedImage};
+use crate::dng_jpeg_image::{keep_lossy_compressed_image, DngJxlImage, DngLossyCompressedImage};
 use crate::dng_linearization_info::DngLinearizationInfo;
 use crate::dng_mosaic_info::DngMosaicInfo;
 use crate::dng_noise_profile::DngNoiseProfile;
@@ -1568,6 +1569,218 @@ pub struct DngNegative {
     /// `fProfileGainTableMap` — profile gain table map.
     pub profile_gain_table_map: Option<std::sync::Arc<crate::dng_gain_map::DngGainTableMap>>,
 }
+
+// ---------------------------------------------------------------------------
+// JXL proxy / lossy-mosaic encode support (dng_negative.cpp:6183+).
+// ---------------------------------------------------------------------------
+
+/// `SupportsJXL (image)` (dng_jxl.cpp:3504).
+pub(crate) fn supports_jxl_image(image: &dyn DngImage) -> bool {
+    let planes = image.planes();
+    let pixel_type = image.pixel_type();
+    (planes == 1 || planes == 3)
+        && (pixel_type == ttByte
+            || pixel_type == ttShort
+            || pixel_type == ttHalfFloat
+            || pixel_type == ttFloat)
+}
+
+/// `dng_host::use_case_enum` (dng_host.h).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DngJxlUseCase {
+    LossyMosaic,
+    LosslessMosaic,
+    MainImage,
+    LosslessMainImage,
+    EncodedMainImage,
+    ProxyImage,
+    EnhancedImage,
+    LosslessEnhancedImage,
+    MergeResults,
+    Transparency,
+    LosslessGainMap,
+    LosslessTransparency,
+}
+
+impl DngJxlUseCase {
+    /// `dng_host::MakeJXLEncodeSettings` distance/effort table
+    /// (dng_host.cpp:633).  Returns (effort, distance).  The Rust
+    /// `dng-jxl` crate maps distance 0 to its lossless modular path and
+    /// nonzero distances to approximate quality (see dng-jxl
+    /// PORTING_NOTES).
+    pub fn encode_settings(
+        &self,
+        is_float: bool,
+        width: uint32,
+        height: uint32,
+    ) -> (u8, f32) {
+        let effort = 7;
+
+        match self {
+            DngJxlUseCase::LossyMosaic => (effort, 0.2),
+            DngJxlUseCase::LosslessMosaic
+            | DngJxlUseCase::LosslessMainImage
+            | DngJxlUseCase::LosslessEnhancedImage
+            | DngJxlUseCase::LosslessGainMap => (effort, 0.0),
+            DngJxlUseCase::MainImage
+            | DngJxlUseCase::EncodedMainImage
+            | DngJxlUseCase::ProxyImage => {
+                let use_higher_quality = *self != DngJxlUseCase::ProxyImage
+                    || (width as uint64 * height as uint64) >= 5_000_000;
+
+                let distance = if is_float {
+                    if use_higher_quality { 1.0 } else { 2.0 }
+                } else {
+                    if use_higher_quality { 0.5 } else { 1.0 }
+                };
+
+                (effort, distance)
+            }
+            DngJxlUseCase::EnhancedImage => {
+                (effort, if is_float { 0.5 } else { 0.01 })
+            }
+            DngJxlUseCase::MergeResults => {
+                (effort, if is_float { 0.5 } else { 0.1 })
+            }
+            DngJxlUseCase::Transparency => {
+                (effort, if is_float { 1.0 } else { 0.0 })
+            }
+            DngJxlUseCase::LosslessTransparency => (effort, 0.0),
+        }
+    }
+}
+
+/// Encode `image` into a `DngJxlImage` with the given use case
+/// (mirrors `dng_jxl_image::Encode` + `EncodeTiles` through the writer).
+pub(crate) fn encode_jxl_image(
+    image: &ImageRef,
+    use_case: DngJxlUseCase,
+) -> DngResult<DngJxlImage> {
+    {
+        let img = image.read().unwrap();
+
+        if !supports_jxl_image(&*img) {
+            return Err(dng_core::dng_exceptions::bad_format()); // "Unsupported image"
+        }
+    }
+
+    let (width, height, planes, pixel_type) = {
+        let img = image.read().unwrap();
+        (img.width(), img.height(), img.planes(), img.pixel_type())
+    };
+
+    let is_float = pixel_type == ttFloat;
+
+    let (effort, distance) = use_case.encode_settings(is_float, width, height);
+
+    // Approximate dng-jxl quality mapping from the libjxl distance
+    // (distance 0 -> lossless modular at quality 100).
+    let quality = if distance <= 0.0 {
+        100.0
+    } else {
+        (100.0 - distance * 25.0).max(1.0)
+    };
+
+    let mut lossy_image = DngJxlImage::new();
+
+    // Tile grid matching DngJxlImage::encode (find_tile_size (1024 * 1024)).
+
+    let mut ifd = dng_core::dng_ifd::DngIfd::new();
+
+    ifd.image_width = width;
+    ifd.image_length = height;
+    ifd.samples_per_pixel = planes;
+
+    for plane in 0..planes as usize {
+        if is_float {
+            ifd.bits_per_sample[plane] = 16;
+            ifd.sample_format[plane] = sfFloatingPoint;
+        } else {
+            ifd.bits_per_sample[plane] = if pixel_type == ttShort { 16 } else { 8 };
+        }
+    }
+
+    ifd.compression = ccJXL;
+    ifd.photometric_interpretation = piLinearRaw;
+
+    ifd.find_tile_size(1024 * 1024, 1, 1)?;
+
+    let tile_w = ifd.tile_width;
+    let tile_h = ifd.tile_length;
+
+    let tiles_across = width.div_ceil(tile_w);
+    let tiles_down = height.div_ceil(tile_h);
+
+    let bits = if is_float { 32 } else { ifd.bits_per_sample[0] };
+
+    let mut write_tile = |tile_index: uint32,
+                          stream: &mut DngStream<'static>|
+     -> DngResult<()> {
+        let col = tile_index % tiles_across;
+        let row = tile_index / tiles_across;
+
+        let t = (row * tile_h) as int32;
+        let l = (col * tile_w) as int32;
+        let b = ((row + 1) * tile_h).min(height) as int32;
+        let r = ((col + 1) * tile_w).min(width) as int32;
+
+        let tile_bounds = DngRect::from_corners(t, l, b, r);
+
+        let img = image.read().unwrap();
+
+        let mut buffer = DngPixelBuffer::with_planar_config(
+            tile_bounds,
+            0,
+            planes,
+            pixel_type,
+            pcInterleaved,
+            DngPixelBuffer::allocate_data(tile_bounds, planes, pixel_type)?,
+        )?;
+
+        img.do_get(&mut buffer)?;
+
+        // Extract interleaved samples for the dng-jxl encoder.
+
+        let samples: Vec<uint8> = match &buffer.data {
+            dng_core::dng_pixel_buffer::PixelData::U8(v) => v.clone(),
+            dng_core::dng_pixel_buffer::PixelData::U16(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            dng_core::dng_pixel_buffer::PixelData::F32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            _ => return Err(dng_core::dng_exceptions::bad_format()),
+        };
+
+        let jxl_image = dng_jxl::JxlImage {
+            width: (r - l) as u32,
+            height: (b - t) as u32,
+            channels: planes,
+            bits,
+            data: samples,
+        };
+
+        let opts = dng_jxl::JxlEncodeOptions {
+            quality,
+            effort,
+            bits_per_sample: bits,
+            is_float,
+            channels: planes,
+            exif: None,
+            xmp: None,
+            icc: None,
+        };
+
+        let encoded = dng_jxl::encode_jxl(&jxl_image, &opts).map_err(|e| {
+            DngError::Unsupported(format!("JXL encode failed: {e}"))
+        })?;
+
+        stream.put(&encoded)?;
+
+        Ok(())
+    };
+
+    lossy_image.encode(width, height, planes, pixel_type, &mut write_tile)?;
+
+    Ok(lossy_image)
+}
+
 
 impl DngNegative {
     /// `dng_negative::Make (host)` + `Initialize ()` — the NEGATIVE_API.md
@@ -5870,6 +6083,7 @@ impl DngNegative {
         true
     }
 
+
     /// `LossyCompressMosaicJXL (host, writer)` — lossy compress raw mosaic
     /// image using JXL, if possible.
     ///
@@ -5877,16 +6091,187 @@ impl DngNegative {
     /// (Agent B); returns NotSupported until the writer module lands.
     pub fn lossy_compress_mosaic_jxl(
         &mut self,
-        _host: &mut DngHost,
+        host: &mut DngHost,
         _writer: &mut crate::dng_image_writer::DngImageWriter,
     ) -> DngResult<()> {
-        // PORT-NOTE(dng_negative.cpp:6183): requires the proxy-encode
-        // machinery that has not been ported yet:
-        //   * the static EncodeImageForCompression helper (histogram-based
-        //     range trim + dng_jxl_proxy_curve / dng_jpeg_proxy_curve tone
-        //     curves), and
-        //   * the dng_lossy_mosaic_task area task (padded mosaic repacking).
-        Err(dng_core::not_yet_implemented())
+        if !self.need_lossy_compress_mosaic_jxl(host) {
+            return Ok(());
+        }
+
+        // C++ (dng_negative.cpp:6183): pad the mosaic to a 2x field with
+        // edge-repeat, run EncodeImageForCompression, interleave 2x2 and
+        // encode as lossy JXL with gray SRGB color encoding.
+
+        if self.raw_image().map(|img| img.read().unwrap().pixel_type()) != Some(ttShort) {
+            return Ok(());
+        }
+
+        if self.raw_image().map(|img| img.read().unwrap().planes()) != Some(1) {
+            return Ok(());
+        }
+
+        let (old_w, old_h) = {
+            let raw = self.raw_image().unwrap().read().unwrap();
+            (raw.width(), raw.height())
+        };
+
+        if old_h < 2 || old_w < 2 {
+            return Ok(());
+        }
+
+        // Field sizes (half resolution, rounded up to tiles).
+
+        let mut field_w = (old_w + 1) / 2;
+        let mut field_h = (old_h + 1) / 2;
+
+        let mut temp_ifd = dng_core::dng_ifd::DngIfd::new();
+
+        temp_ifd.samples_per_pixel = 1;
+        temp_ifd.bits_per_sample[0] = 16;
+        temp_ifd.image_length = field_h;
+        temp_ifd.image_width = field_w;
+
+        temp_ifd.find_tile_size(1024 * 1024, 1, 1)?;
+
+        let tile_w = temp_ifd.tile_width;
+        let tile_h = temp_ifd.tile_length;
+
+        field_w = ((field_w + tile_w - 1) / tile_w) * tile_w;
+        field_h = ((field_h + tile_h - 1) / tile_h) * field_h.min(tile_h).max(1) - field_h.min(tile_h).max(1) + ((field_h + tile_h - 1) / tile_h) * tile_h;
+
+        let padded_w = field_w * 2;
+        let padded_h = field_h * 2;
+
+        let pad_offset_v = (padded_h - old_h) / 2;
+        let pad_offset_h = (padded_w - old_w) / 2;
+
+        let active_area =
+            DngRect::from_corners(pad_offset_v as int32, pad_offset_h as int32,
+                                  (pad_offset_v + old_h) as int32, (pad_offset_h + old_w) as int32);
+
+        // Pad the mosaic image (dng_lossy_mosaic_task: copy the source into
+        // the padded image at the offset with 2-pixel edge repeat).
+
+        let padded: ImageRef = DngSimpleImage::new(
+            DngRect::from_corners(0, 0, padded_h as int32, padded_w as int32),
+            1,
+            ttShort,
+        )?
+        .into_image_ref()?;
+
+        {
+            let src = self.raw_image().unwrap().read().unwrap();
+
+            let mut buffer = DngPixelBuffer::with_planar_config(
+                DngRect::from_corners(0, 0, padded_h as int32, padded_w as int32),
+                0,
+                1,
+                ttShort,
+                pcInterleaved,
+                DngPixelBuffer::allocate_data(
+                    DngRect::from_corners(0, 0, padded_h as int32, padded_w as int32),
+                    1,
+                    ttShort,
+                )?,
+            )?;
+
+            src.get(
+                &mut buffer,
+                dng_core::dng_image::EdgeOption::EdgeRepeat,
+                2,
+                2,
+            )?;
+
+            // Shift into the padded position (the C++ task reads the source
+            // at tile - offset, i.e. the destination holds the source shifted
+            // by the pad offset with edge repeat).
+
+            let mut shifted = DngPixelBuffer::with_planar_config(
+                DngRect::from_corners(
+                    pad_offset_v as int32,
+                    pad_offset_h as int32,
+                    (pad_offset_v + old_h) as int32,
+                    (pad_offset_h + old_w) as int32,
+                ),
+                0,
+                1,
+                ttShort,
+                pcInterleaved,
+                DngPixelBuffer::allocate_data(
+                    DngRect::from_corners(0, 0, padded_h as int32, padded_w as int32),
+                    1,
+                    ttShort,
+                )?,
+            )?;
+
+            shifted.data =
+                dng_core::dng_pixel_buffer::PixelData::U16(
+                    buffer.as_u16_slice().unwrap().to_vec(),
+                );
+
+            padded.write().unwrap().do_put(&shifted)?;
+        }
+
+        self.raw_image = Some(padded);
+        self.set_active_area(active_area);
+        self.set_black_level(self.raw_image_black_level() as real64, 0);
+
+        // EncodeImageForCompression on the padded raw image.
+
+        let raw_image = self.raw_image().unwrap().clone();
+
+        let src_black = self.raw_image_black_level() as real64 * (1.0 / 65535.0);
+
+        let mut dst_black = [0.0; dng_core::dng_sdk_limits::kMaxColorPlanes as usize];
+
+        let compressed_image = encode_image_for_compression(
+            host,
+            &raw_image,
+            active_area,
+            true, // isSceneReferred
+            true, // use16Bit
+            src_black,
+            &mut dst_black,
+            self.opcode_list2_mut(),
+        )?;
+
+        if let Some(image) = compressed_image {
+            self.raw_image = Some(image);
+        }
+
+        self.set_black_level(round_int32_f64(dst_black[0]) as real64, 0);
+
+        // Interleave 2x2 into the field image.
+
+        let raw_image = self.raw_image().unwrap().clone();
+
+        let (raw_w, raw_h) = {
+            let raw = raw_image.read().unwrap();
+            (raw.width(), raw.height())
+        };
+
+        let temp: ImageRef = DngSimpleImage::new(
+            raw_image.read().unwrap().bounds(),
+            1,
+            ttShort,
+        )?
+        .into_image_ref()?;
+
+        crate::dng_read_image::interleave_2d(&raw_image, &*temp.read().unwrap(), 2, 2, true)?;
+
+        // Encode as lossy JXL (use_case_LossyMosaic).
+
+        let mut lossy_image = encode_jxl_image(&temp, DngJxlUseCase::LossyMosaic)?;
+
+        lossy_image.base.row_interleave_factor = 2;
+        lossy_image.base.column_interleave_factor = 2;
+
+        self.set_raw_lossy_compressed_image(Some(Box::new(lossy_image.base)));
+
+        self.clear_raw_lossy_compressed_image_digest();
+        self.clear_raw_image_digest();
+
+        Ok(())
     }
 
     /// `LosslessCompressJXL (host, writer, nearLosslessOK)`.
@@ -5895,17 +6280,136 @@ impl DngNegative {
     /// (Agent B); returns NotSupported until the writer module lands.
     pub fn lossless_compress_jxl(
         &mut self,
-        _host: &mut DngHost,
+        host: &mut DngHost,
         _writer: &mut crate::dng_image_writer::DngImageWriter,
-        _near_lossless_ok: bool,
+        near_lossless_ok: bool,
     ) -> DngResult<()> {
-        // PORT-NOTE(dng_negative.cpp:6493): needs DngJxlImage::encode wired
-        // to the writer tile encoder plus the Interleave2D helper
-        // (dng_interleave_task, dng_read_image.cpp:3151) for the mosaic
-        // path. The core JXL encode exists (dng-jxl crate + writer tile
-        // dispatch); the missing pieces are the interleave task and the
-        // use-case quality mapping table.
-        Err(dng_core::not_yet_implemented())
+        // C++ (dng_negative.cpp:6493).
+
+        if host.save_dng_version() != 0
+            && host.save_dng_version() < crate::dng_image_writer::min_backward_version_for_compression(ccJXL)
+        {
+            return Ok(());
+        }
+
+        if self.raw_lossy_compressed_image().is_none() {
+            let mosaic_is_cfa = self
+                .get_mosaic_info()
+                .map(|info| info.is_color_filter_array())
+                .unwrap_or(false);
+
+            if mosaic_is_cfa {
+                let (pattern_v, pattern_h) = {
+                    let info = self.get_mosaic_info().unwrap();
+                    let size = info.cfa_pattern_size;
+                    (size.v, size.h)
+                };
+
+                let raw_ok = {
+                    let raw = self.raw_image().unwrap().read().unwrap();
+                    host.save_dng_version() >= dngVersion_1_7_1_0
+                        && pattern_h >= 2
+                        && (pattern_h as int32) < raw.width() as int32
+                        && pattern_v >= 2
+                        && (pattern_v as int32) < raw.height() as int32
+                        && raw.planes() == 1
+                        && raw.pixel_type() == ttShort
+                };
+
+                if raw_ok {
+                    // Interleave2D (encode) with the CFA pattern factors.
+
+                    let raw_image = self.raw_image().unwrap().clone();
+
+                    let temp: ImageRef = DngSimpleImage::new(
+                        raw_image.read().unwrap().bounds(),
+                        1,
+                        ttShort,
+                    )?
+                    .into_image_ref()?;
+
+                    crate::dng_read_image::interleave_2d(
+                        &raw_image,
+                        &*temp.read().unwrap(),
+                        pattern_v,
+                        pattern_h,
+                        true,
+                    )?;
+
+                    let mut lossy_image =
+                        encode_jxl_image(&temp, DngJxlUseCase::LosslessMosaic)?;
+
+                    lossy_image.base.row_interleave_factor = pattern_v as uint32;
+                    lossy_image.base.column_interleave_factor = pattern_h as uint32;
+
+                    self.raw_lossy_compressed_image = Some(Box::new(lossy_image.base));
+
+                    self.clear_raw_lossy_compressed_image_digest();
+                    self.clear_raw_image_digest();
+                }
+            } else {
+                let raw_ok = {
+                    let raw = self.raw_image().unwrap().read().unwrap();
+
+                    supports_jxl_image(&*raw)
+                        && (raw.pixel_type() != ttFloat || self.raw_float_bit_depth() == 16)
+                };
+
+                if raw_ok {
+                    let raw_image = self.raw_image().unwrap().clone();
+
+                    let use_case = if near_lossless_ok {
+                        DngJxlUseCase::MainImage
+                    } else {
+                        DngJxlUseCase::LosslessMainImage
+                    };
+
+                    let mut lossy_image = encode_jxl_image(&raw_image, use_case)?;
+
+                    self.raw_lossy_compressed_image = Some(Box::new(lossy_image.base));
+
+                    self.clear_raw_lossy_compressed_image_digest();
+                    self.clear_raw_image_digest();
+                }
+            }
+        }
+
+        // Enhanced image (C++ 6553+): requires EnhanceParams and a distinct
+        // stage3.  The port mirrors the guard; encoding reuses the raw
+        // transparency-mask slot conditions which do not apply to synthetic
+        // negatives here.
+
+        if self.enhanced_lossy_compressed_image().is_none()
+            && self.enhance_params.not_empty()
+            && self.raw_image().is_some()
+            && self.stage3_image().is_some()
+            && !std::sync::Arc::ptr_eq(
+                self.raw_image().unwrap(),
+                self.stage3_image().unwrap(),
+            )
+        {
+            let stage3 = self.stage3_image().unwrap().clone();
+
+            let stage3_ok = {
+                let img = stage3.read().unwrap();
+                supports_jxl_image(&*img)
+                    && (img.pixel_type() == ttShort || near_lossless_ok)
+            };
+
+            if stage3_ok {
+                let use_case = if near_lossless_ok {
+                    DngJxlUseCase::EnhancedImage
+                } else {
+                    DngJxlUseCase::LosslessEnhancedImage
+                };
+
+                let mut lossy_image = encode_jxl_image(&stage3, use_case)?;
+
+                self.enhanced_lossy_compressed_image = Some(Box::new(lossy_image.base));
+            }
+        }
+
+        Ok(())
     }
 
     /// `EncodeRawProxy (host, srcImage, opcodeList, blackLevel)`.
@@ -5914,12 +6418,39 @@ impl DngNegative {
     /// (histogram trim + proxy curves) — see lossy_compress_mosaic_jxl.
     pub fn encode_raw_proxy(
         &self,
-        _host: &mut DngHost,
-        _src_image: &ImageRef,
-        _opcode_list: &mut DngOpcodeList,
-        _black_level: &mut [real64],
+        host: &mut DngHost,
+        src_image: &ImageRef,
+        opcode_list: &mut DngOpcodeList,
+        black_level: &mut [real64],
     ) -> DngResult<ImageRef> {
-        Err(dng_core::not_yet_implemented()) // requires dng_image_writer
+        // C++ (dng_negative.cpp:6630).
+
+        let use_16bit = {
+            let img = src_image.read().unwrap();
+
+            supports_jxl_image(&*img)
+                && (host.save_dng_version() == 0
+                    || host.save_dng_version()
+                        >= crate::dng_image_writer::min_backward_version_for_compression(ccJXL))
+        };
+
+        let mut black: [real64; dng_core::dng_sdk_limits::kMaxColorPlanes as usize] =
+            [0.0; dng_core::dng_sdk_limits::kMaxColorPlanes as usize];
+
+        let result = encode_image_for_compression(
+            host,
+            src_image,
+            src_image.read().unwrap().bounds(),
+            self.is_scene_referred(),
+            use_16bit,
+            self.stage3_black_level_normalized(),
+            &mut black,
+            opcode_list,
+        )?;
+
+        black_level.copy_from_slice(&black[..black_level.len()]);
+
+        result.ok_or_else(program_error)
     }
 
     /// `ConvertToProxy (host, writer, proxySize, proxyCount)`.
@@ -5928,12 +6459,370 @@ impl DngNegative {
     /// (Agent B); returns NotSupported until the writer module lands.
     pub fn convert_to_proxy(
         &mut self,
-        _host: &mut DngHost,
-        _writer: &mut dyn std::any::Any,
-        _proxy_size: uint32,
-        _proxy_count: uint64,
+        host: &mut DngHost,
+        _writer: &mut crate::dng_image_writer::DngImageWriter,
+        proxy_size: uint32,
+        proxy_count: uint64,
     ) -> DngResult<()> {
-        Err(dng_core::not_yet_implemented()) // requires dng_image_writer
+        // C++ (dng_negative.cpp:6673).
+
+        let proxy_size = if proxy_size == 0 {
+            dng_core::dng_sdk_limits::kMaxImageSide
+        } else {
+            proxy_size
+        };
+
+        let proxy_count = if proxy_count == 0 {
+            proxy_size as uint64 * proxy_size as uint64
+        } else {
+            proxy_count
+        };
+
+        let non_full_size_proxy = (proxy_size < dng_core::dng_sdk_limits::kMaxImageSide)
+            || (proxy_count
+                < dng_core::dng_sdk_limits::kMaxImageSide as uint64
+                    * dng_core::dng_sdk_limits::kMaxImageSide as uint64);
+
+        if non_full_size_proxy {
+            self.clear_maker_note();
+            self.clear_private_data();
+        }
+
+        if (self.raw_default_crop_size_h().as_real64()
+            < self.default_crop_size_h().as_real64())
+            && (self.raw_default_crop_size_v().as_real64()
+                < self.default_crop_size_v().as_real64())
+        {
+            self.set_original_default_final_size(DngPoint::new(0, 0));
+            self.set_original_best_quality_final_size(DngPoint::new(0, 0));
+            self.set_original_default_crop_size(DngURational::new(0, 1), DngURational::new(0, 1));
+            self.set_default_original_sizes();
+        }
+
+        let use_jxl = (self.color_channels() == 1 || self.color_channels() == 3)
+            && (host.save_dng_version() == 0
+                || host.save_dng_version()
+                    >= crate::dng_image_writer::min_backward_version_for_compression(ccJXL));
+
+        let pixel_aspect = self.pixel_aspect_ratio();
+
+        let non_square_pixels = pixel_aspect < 0.99 || pixel_aspect > 1.01;
+
+        // rawImageOK conditions (C++ 6760-6790).
+
+        let mut raw_image_ok = false;
+
+        if let Some(raw) = &self.raw_image {
+            let raw = raw.read().unwrap();
+
+            let crop_area = self.default_crop_area();
+
+            raw_image_ok = raw.bounds() == crop_area
+                && raw.bounds().h() <= proxy_size
+                && raw.bounds().w() <= proxy_size
+                && (raw.bounds().h() as uint64) * (raw.bounds().w() as uint64) <= proxy_count;
+        }
+
+        if raw_image_ok && use_jxl {
+            let code_ok = self
+                .raw_lossy_compressed_image()
+                .map(|img| img.compression_code != ccJXL)
+                .unwrap_or(false);
+
+            if code_ok {
+                raw_image_ok = false;
+            }
+        }
+
+        if self
+            .raw_lossy_compressed_image()
+            .map(|img| img.compression_code == ccJXL && img.jxl_distance == 0.0)
+            .unwrap_or(false)
+        {
+            raw_image_ok = false;
+        }
+
+        if !raw_image_ok {
+            // AdjustGainMapForStage3 / AdjustProfileForStage3 are no-ops in
+            // the C++ (dng_negative.cpp:6642/6646).
+
+            self.raw_image = None;
+
+            self.raw_default_scale_h = DngURational::new(0, 1);
+            self.raw_default_scale_v = DngURational::new(0, 1);
+            self.raw_best_quality_scale = DngURational::new(0, 1);
+            self.raw_default_crop_size_h = DngURational::new(0, 1);
+            self.raw_default_crop_size_v = DngURational::new(0, 1);
+            self.raw_default_crop_origin_h = DngURational::new(0, 1);
+            self.raw_default_crop_origin_v = DngURational::new(0, 1);
+            self.raw_image_black_level = 0;
+
+            self.clear_raw_lossy_compressed_image();
+            self.set_raw_float_bit_depth(0);
+            self.clear_linearization_info();
+            self.clear_mosaic_info();
+
+            self.opcode_list1_mut().clear();
+            self.opcode_list2_mut().clear();
+            self.opcode_list3_mut().clear();
+
+            self.clear_raw_image_digest();
+            self.clear_raw_lossy_compressed_image_digest();
+
+            self.enhance_params = DngString::new();
+            self.enhanced_lossy_compressed_image = None;
+        }
+
+        let default_crop_area = self.default_crop_area();
+
+        let original_stage3_bounds = self
+            .stage3_image()
+            .ok_or_else(dng_core::dng_exceptions::bad_format)?
+            .read()
+            .unwrap()
+            .bounds();
+
+        if !raw_image_ok && original_stage3_bounds != default_crop_area {
+            // Trim stage3 (and maps) to the default crop area.  The port
+            // materializes a trimmed copy via ResizeTransparency-style clone
+            // (C++ uses dng_image::Trim, only supported by dng_simple_image).
+
+            let stage3 = self.stage3_image().unwrap().clone();
+
+            let trimmed: ImageRef = {
+                let src = stage3.read().unwrap();
+
+                let bounds = src.bounds();
+
+                let sub = bounds.and_(default_crop_area);
+
+                let mut buffer = DngPixelBuffer::with_planar_config(
+                    sub,
+                    0,
+                    src.planes(),
+                    src.pixel_type(),
+                    pcInterleaved,
+                    DngPixelBuffer::allocate_data(sub, src.planes(), src.pixel_type())?,
+                )?;
+
+                src.do_get(&mut buffer)?;
+
+                let image = DngSimpleImage::new(
+                    DngRect::from_corners(0, 0, sub.h() as int32, sub.w() as int32),
+                    src.planes(),
+                    src.pixel_type(),
+                )?
+                .into_image_ref()?;
+
+                {
+                    let mut dst = image.write().unwrap();
+
+                    let mut dst_buf = buffer.clone();
+
+                    dst_buf.area = DngRect::from_corners(0, 0, sub.h() as int32, sub.w() as int32);
+
+                    dst.do_put(&dst_buf)?;
+                }
+
+                image
+            };
+
+            self.set_stage3_image(Some(trimmed));
+
+            // PORT-NOTE(dng_negative.cpp:6903): the profile gain-table-map
+            // re-projection when the stage3 is trimmed is not ported (the
+            // gain map API exposes the geometry, but the C++ reconstructs
+            // the underlying buffer through private accessors).
+        }
+
+        // Proxy size computation (C++ 6940-7010).
+
+        let aspect_ratio = self.aspect_ratio();
+
+        let mut new_w = proxy_size as int32;
+        let mut new_h = proxy_size as int32;
+
+        if aspect_ratio >= 1.0 {
+            new_h = max_int32(1, round_int32_f64(proxy_size as f64 / aspect_ratio));
+        } else {
+            new_w = max_int32(1, round_int32_f64(proxy_size as f64 * aspect_ratio));
+        }
+
+        new_h = min_int32(new_h, self.default_final_height() as int32);
+        new_w = min_int32(new_w, self.default_final_width() as int32);
+
+        if (new_h as uint64) * (new_w as uint64) > proxy_count {
+            if aspect_ratio >= 1.0 {
+                new_w = (proxy_count as f64 * aspect_ratio).sqrt() as int32;
+                new_h = max_int32(1, round_int32_f64(new_w as f64 / aspect_ratio));
+            } else {
+                new_h = (proxy_count as f64 / aspect_ratio).sqrt() as int32;
+                new_w = max_int32(1, round_int32_f64(new_h as f64 * aspect_ratio));
+            }
+        }
+
+        let old_size = default_crop_area.size();
+
+        if ((new_h as uint64) * (new_w as uint64)
+            < (old_size.v as uint64) * (old_size.h as uint64))
+            || non_square_pixels
+        {
+            let stage3 = self.stage3_image().unwrap().clone();
+
+            let dst: ImageRef = DngSimpleImage::new(
+                DngRect::from_corners(0, 0, new_h, new_w),
+                stage3.read().unwrap().planes(),
+                stage3.read().unwrap().pixel_type(),
+            )?
+            .into_image_ref()?;
+
+            dng_core::dng_resample::resample_image(
+                host,
+                stage3.clone(),
+                dst.clone(),
+                stage3.read().unwrap().bounds(),
+                DngRect::from_corners(0, 0, new_h, new_w),
+            )?;
+
+            self.set_stage3_image(Some(dst));
+
+            self.set_default_crop_size_u32(new_w as uint32, new_h as uint32);
+            self.set_default_scale(DngURational::new(1, 1), DngURational::new(1, 1));
+            self.set_best_quality_scale(DngURational::new(1, 1));
+            self.set_raw_to_full_scale(1.0, 1.0);
+        } else if self.raw_to_full_scale_h != 1.0 || self.raw_to_full_scale_v != 1.0 {
+            self.set_default_crop_size_u32(old_size.h as uint32, old_size.v as uint32);
+            self.set_default_scale(DngURational::new(1, 1), DngURational::new(1, 1));
+            self.set_best_quality_scale(DngURational::new(1, 1));
+            self.set_raw_to_full_scale(1.0, 1.0);
+        }
+
+        // Encode the proxy raw image.
+
+        if self.raw_image.is_none() {
+            if use_jxl {
+                let is_float_raw = self
+                    .raw_image
+                    .as_ref()
+                    .map(|raw| {
+                        let img = raw.read().unwrap();
+                        img.pixel_type() == ttFloat && self.raw_float_bit_depth() != 16
+                    })
+                    .unwrap_or(false);
+
+                if is_float_raw {
+                    // LimitFloatBitDepth to 16 — ported in dng-core
+                    // (DngLimitFloatDepthTask).
+
+                    let src = self.stage3_image().unwrap().clone();
+
+                    let (bounds, planes) = {
+                        let img = src.read().unwrap();
+                        (img.bounds(), img.planes())
+                    };
+
+                    let dst: ImageRef = DngSimpleImage::new(bounds, planes, ttFloat)?
+                        .into_image_ref()?;
+
+                    dng_core::dng_utils::limit_float_bit_depth(
+                        host,
+                        src.clone(),
+                        dst.clone(),
+                        16,
+                        32768.0,
+                    )?;
+
+                    self.raw_image = Some(dst);
+                    self.raw_image_black_level = 0;
+                    self.set_raw_float_bit_depth(16);
+                    self.set_white_level(32768, 0);
+                }
+
+                if self.raw_lossy_compressed_image().is_none() {
+                    if let Some(raw) = &self.raw_image {
+                        let use_case = if non_full_size_proxy {
+                            DngJxlUseCase::ProxyImage
+                        } else {
+                            DngJxlUseCase::EncodedMainImage
+                        };
+
+                        let lossy_image = encode_jxl_image(raw, use_case)?;
+
+                        self.raw_lossy_compressed_image = Some(Box::new(lossy_image.base));
+                    }
+                }
+            } else if let Some(raw) = &self.raw_image {
+                if raw.read().unwrap().pixel_type() == ttShort {
+                    let stage3 = self.stage3_image().unwrap().clone();
+
+                    let mut black: [real64; dng_core::dng_sdk_limits::kMaxColorPlanes as usize] =
+                        [0.0; dng_core::dng_sdk_limits::kMaxColorPlanes as usize];
+
+                    // encode_raw_proxy reads is_scene_referred and
+                    // stage3_black_level_normalized; snapshot them first so
+                    // the opcode list can be borrowed mutably.
+
+                    let is_scene = self.is_scene_referred();
+
+                    let use_jxl_proxy_16bit = {
+                        let img = stage3.read().unwrap();
+
+                        supports_jxl_image(&*img)
+                            && (host.save_dng_version() == 0
+                                || host.save_dng_version()
+                                    >= crate::dng_image_writer::min_backward_version_for_compression(ccJXL))
+                    };
+
+                    let stage3_black = self.stage3_black_level_normalized();
+
+                    let bounds = stage3.read().unwrap().bounds();
+
+                    let proxy = encode_image_for_compression(
+                        host,
+                        &stage3,
+                        bounds,
+                        is_scene,
+                        use_jxl_proxy_16bit,
+                        stage3_black,
+                        &mut black,
+                        &mut self.opcode_list2,
+                    )?;
+
+                    let proxy = proxy.ok_or_else(dng_core::dng_exceptions::program_error)?;
+
+                    self.raw_image = Some(proxy);
+                    self.raw_image_black_level = 0;
+
+                    self.set_white_level(255, 0);
+
+                    for plane in 0..self.color_channels() as int32 {
+                        self.set_black_level(black[plane as usize], plane);
+                    }
+                }
+
+                if let Some(raw) = &self.raw_image {
+                    if raw.read().unwrap().pixel_type() == ttByte {
+                        // C++ encodes a lossy JPEG image via
+                        // dng_jpeg_image::Encode; the port encodes through
+                        // the JXL path when JXL is disabled for byte images
+                        // (rare in practice) — keep the raw image
+                        // uncompressed instead (PORT-NOTE).
+
+                        self.raw_lossy_compressed_image = None;
+                    }
+                }
+            }
+        }
+
+        // Transparency mask (C++ 7245+): resize to match stage3 + JXL
+        // compress.  The port currently keeps the mask uncompressed.
+
+        if self.transparency_mask().is_some() {
+            // PORT-NOTE(dng_negative.cpp:7245): ResizeTransparencyToMatchStage3
+            // + CompressTransparencyMaskJXL are not ported yet.
+        }
+
+        Ok(())
     }
 
     /// `IsProxy ()` (dng_negative.cpp:7319).
@@ -8042,5 +8931,307 @@ mod tests {
         // "AAAA" decodes to 2 bytes and lands in the dictionary.
 
         assert_eq!(dictionary.map().len(), 1);
+    }
+    /// lossless_compress_jxl on a synthetic negative: raw JXL tiles decode
+    /// back losslessly.
+    #[test]
+    fn lossless_compress_jxl_round_trip() {
+        let mut host = DngHost::new();
+
+        host.set_save_dng_version(dngVersion_1_7_1_0);
+
+        let mut negative = DngNegative::new(&mut host).unwrap();
+
+        let width = 24u32;
+        let height = 16u32;
+
+        let bounds = DngRect::from_corners(0, 0, height as int32, width as int32);
+
+        let image: ImageRef = DngSimpleImage::new(bounds, 1, ttShort)
+            .unwrap()
+            .into_image_ref()
+            .unwrap();
+
+        {
+            let mut buffer = DngPixelBuffer::with_planar_config(
+                bounds,
+                0,
+                1,
+                ttShort,
+                pcInterleaved,
+                DngPixelBuffer::allocate_data(bounds, 1, ttShort).unwrap(),
+            )
+            .unwrap();
+
+            let samples = buffer.as_u16_slice_mut().unwrap();
+
+            for (index, sample) in samples.iter_mut().enumerate() {
+                *sample = ((index * 365) % 65535) as u16;
+            }
+
+            image.write().unwrap().do_put(&buffer).unwrap();
+        }
+
+        negative.raw_image = Some(image.clone());
+        negative.set_default_crop_size_u32(width, height);
+
+        let mut writer = crate::dng_image_writer::DngImageWriter::new();
+
+        negative
+            .lossless_compress_jxl(&mut host, &mut writer, false)
+            .unwrap();
+
+        let lossy = negative
+            .raw_lossy_compressed_image()
+            .expect("raw lossy image must be set");
+
+        assert_eq!(lossy.compression_code, ccJXL);
+        assert!(lossy.tiles.data.len() > 0);
+        assert!(lossy.tiles.data[0].is_some());
+
+        // Decode tile 0 through the dng-jxl crate and compare against the
+        // same tile region of the source (lossless must be bit-exact).
+
+        let block = lossy.tiles.data[0].as_ref().unwrap();
+
+        let mut stream = dng_core::dng_memory_stream::DngMemoryStream::new().stream();
+
+        stream.put(block.buffer()).unwrap();
+
+        stream.set_read_position(0).unwrap();
+
+        let length = stream.length() as uint32;
+
+        let bytes = stream.get(length).unwrap();
+
+        let decoded = dng_jxl::decode_jxl(&bytes).unwrap();
+
+        // Tile layout: 1MB tiles over a 24x16 image = single tile.
+
+        assert_eq!(decoded.width, width);
+        assert_eq!(decoded.height, height);
+
+        let source = image.read().unwrap();
+
+        let mut buffer = DngPixelBuffer::with_planar_config(
+            bounds,
+            0,
+            1,
+            ttShort,
+            pcInterleaved,
+            DngPixelBuffer::allocate_data(bounds, 1, ttShort).unwrap(),
+        )
+        .unwrap();
+
+        source.do_get(&mut buffer).unwrap();
+
+        let source_samples = buffer.as_u16_slice().unwrap();
+
+        let decoded_samples = &decoded.data;
+
+        // 16-bit samples, interleaved LE.
+
+        for (index, sample) in source_samples.iter().enumerate() {
+            let lo = decoded_samples[index * 2] as uint16;
+            let hi = decoded_samples[index * 2 + 1] as uint16;
+
+            let value = lo | (hi << 8);
+
+            assert_eq!(value, *sample, "lossless mismatch at {index}");
+        }
+    }
+
+    /// encode_raw_proxy on a synthetic stage3: returns a proxy image and
+    /// appends opcode list entries.
+    #[test]
+    fn encode_raw_proxy_shapes() {
+        let mut host = DngHost::new();
+
+        let negative = DngNegative::new(&mut host).unwrap();
+
+        let width = 16u32;
+        let height = 12u32;
+
+        let bounds = DngRect::from_corners(0, 0, height as int32, width as int32);
+
+        let image: ImageRef = DngSimpleImage::new(bounds, 1, ttShort)
+            .unwrap()
+            .into_image_ref()
+            .unwrap();
+
+        {
+            let mut buffer = DngPixelBuffer::with_planar_config(
+                bounds,
+                0,
+                1,
+                ttShort,
+                pcInterleaved,
+                DngPixelBuffer::allocate_data(bounds, 1, ttShort).unwrap(),
+            )
+            .unwrap();
+
+            let samples = buffer.as_u16_slice_mut().unwrap();
+
+            for (index, sample) in samples.iter_mut().enumerate() {
+                *sample = ((index * 501) % 40000) as u16;
+            }
+
+            image.write().unwrap().do_put(&buffer).unwrap();
+        }
+
+        let mut opcode_list = crate::dng_opcode_list::DngOpcodeList::new(2);
+
+        let mut black = [0.0; dng_core::dng_sdk_limits::kMaxColorPlanes as usize];
+
+        let mut host = DngHost::new();
+
+        let proxy = negative
+            .encode_raw_proxy(&mut host, &image, &mut opcode_list, &mut black)
+            .unwrap();
+
+        let proxy_img = proxy.read().unwrap();
+
+        assert_eq!(proxy_img.pixel_type(), ttShort);
+        assert_eq!(proxy_img.width(), width);
+        assert_eq!(proxy_img.height(), height);
+
+        // The opcode list gains per-plane MapPolynomial entries.
+
+        assert!(opcode_list.count() >= 1);
+    }
+    /// convert_to_proxy on a synthetic negative: stage3 resampled to the
+    /// proxy size and a raw proxy image encoded.
+    #[test]
+    fn convert_to_proxy_shapes() {
+        let mut host = DngHost::new();
+
+        let mut negative = DngNegative::new(&mut host).unwrap();
+
+        let width = 64u32;
+        let height = 48u32;
+
+        let bounds = DngRect::from_corners(0, 0, height as int32, width as int32);
+
+        let image: ImageRef = DngSimpleImage::new(bounds, 1, ttShort)
+            .unwrap()
+            .into_image_ref()
+            .unwrap();
+
+        {
+            let mut buffer = DngPixelBuffer::with_planar_config(
+                bounds,
+                0,
+                1,
+                ttShort,
+                pcInterleaved,
+                DngPixelBuffer::allocate_data(bounds, 1, ttShort).unwrap(),
+            )
+            .unwrap();
+
+            let samples = buffer.as_u16_slice_mut().unwrap();
+
+            for (index, sample) in samples.iter_mut().enumerate() {
+                *sample = ((index * 353) % 65535) as u16;
+            }
+
+            image.write().unwrap().do_put(&buffer).unwrap();
+        }
+
+        negative.set_stage3_image(Some(image));
+        negative.set_default_crop_size_u32(width, height);
+        negative.set_active_area(bounds);
+
+        negative
+            .convert_to_proxy(&mut host, &mut crate::dng_image_writer::DngImageWriter::new(), 16, 0)
+            .unwrap();
+
+        // Stage3 must now be the proxy size (16 wide).
+
+        let stage3 = negative.stage3_image().unwrap().clone();
+
+        {
+            let img = stage3.read().unwrap();
+
+            assert_eq!(img.width(), 16);
+            assert!(img.height() <= 16);
+        }
+
+        // A raw image must exist (encoded proxy).
+
+        assert!(negative.raw_image().is_some());
+    }
+
+    /// lossy_compress_mosaic_jxl on a Bayer negative.
+    #[test]
+    fn lossy_compress_mosaic_shapes() {
+        let mut host = DngHost::new();
+
+        host.set_save_dng_version(dngVersion_1_7_1_0);
+        host.set_lossy_mosaic_jxl(true);
+
+        let mut negative = DngNegative::new(&mut host).unwrap();
+
+        let width = 32u32;
+        let height = 32u32;
+
+        let bounds = DngRect::from_corners(0, 0, height as int32, width as int32);
+
+        let image: ImageRef = DngSimpleImage::new(bounds, 1, ttShort)
+            .unwrap()
+            .into_image_ref()
+            .unwrap();
+
+        {
+            let mut buffer = DngPixelBuffer::with_planar_config(
+                bounds,
+                0,
+                1,
+                ttShort,
+                pcInterleaved,
+                DngPixelBuffer::allocate_data(bounds, 1, ttShort).unwrap(),
+            )
+            .unwrap();
+
+            let samples = buffer.as_u16_slice_mut().unwrap();
+
+            for (index, sample) in samples.iter_mut().enumerate() {
+                *sample = ((index * 97) % 40000 + 1000) as u16;
+            }
+
+            image.write().unwrap().do_put(&buffer).unwrap();
+        }
+
+        negative.raw_image = Some(image);
+        negative.set_default_crop_size_u32(width, height);
+
+        // Mosaic info: 2x2 RGGB (cfa_pattern_size non-zero marks CFA).
+
+        let mut mosaic = crate::dng_mosaic_info::DngMosaicInfo::new();
+
+        mosaic.cfa_pattern_size = DngPoint::new(2, 2);
+        mosaic.cfa_plane_color[0] = 0;
+        mosaic.cfa_plane_color[1] = 1;
+        mosaic.cfa_plane_color[2] = 2;
+        mosaic.cfa_pattern[0][0] = 0;
+        mosaic.cfa_pattern[0][1] = 1;
+        mosaic.cfa_pattern[1][0] = 1;
+        mosaic.cfa_pattern[1][1] = 2;
+
+        negative.mosaic_info = Some(Box::new(mosaic));
+
+        let mut writer = crate::dng_image_writer::DngImageWriter::new();
+
+        negative
+            .lossy_compress_mosaic_jxl(&mut host, &mut writer)
+            .unwrap();
+
+        let lossy = negative
+            .raw_lossy_compressed_image()
+            .expect("raw lossy image must be set");
+
+        assert_eq!(lossy.compression_code, ccJXL);
+        assert_eq!(lossy.row_interleave_factor, 2);
+        assert_eq!(lossy.column_interleave_factor, 2);
+        assert!(lossy.tiles.data[0].is_some());
     }
 }
