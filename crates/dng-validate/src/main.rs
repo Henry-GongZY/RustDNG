@@ -36,6 +36,8 @@ struct Options {
     out_dng: Option<String>,
     /// `--ppm <file>` — write the rendered image as binary PPM.
     out_ppm: Option<String>,
+    /// `-tif <file>` — write the stage3 image as an uncompressed TIFF.
+    out_tif: Option<String>,
     /// `-cs1..-cs6/-csP3/-cs2020` — render color space index.
     color_space: u8,
     /// `-16` / `-32` — render output depth.
@@ -218,6 +220,38 @@ fn validate_file(options: &Options, path: &str) -> dng_core::DngResult<()> {
         }
     }
 
+    // -tif <file>: write the stage3 image as an uncompressed TIFF
+    // (dng_validate stage dumps use piRGB for >= 3 planes, piBlackIsZero
+    // otherwise).
+
+    if let Some(tif_path) = &options.out_tif {
+        let stage3 = negative.stage3_image().expect("stage3 image").clone();
+
+        let stage3_img = stage3.read().unwrap();
+
+        let photometric = if stage3_img.planes() >= 3 {
+            dng_core::dng_tag_values::piRGB
+        } else {
+            dng_core::dng_tag_values::piBlackIsZero
+        };
+
+        let mut out_stream = DngFileStream::open_write(Path::new(tif_path))?;
+
+        let mut writer = dng_sdk::dng_image_writer::DngImageWriter::new();
+
+        writer.write_tiff_basic(
+            &mut out_stream,
+            &*stage3_img,
+            &dng_sdk::dng_image_writer::TiffWriteOptions {
+                photometric,
+                icc_profile: None,
+                software: Some("RustDNG dng-validate"),
+            },
+        )?;
+
+        println!("  wrote {}", tif_path);
+    }
+
     // -dng <file>: re-save the validated negative (exercises the writer on
     // real data).
 
@@ -284,6 +318,7 @@ fn main() {
         threads: 1,
         out_dng: None,
         out_ppm: None,
+        out_tif: None,
         color_space: 1, // sRGB
         render_16bit: false,
         render_32bit: false,
@@ -311,6 +346,12 @@ fn main() {
                 let v = args.next().unwrap_or_default();
                 if !v.is_empty() {
                     options.out_ppm = Some(v);
+                }
+            }
+            "-tif" => {
+                let v = args.next().unwrap_or_default();
+                if !v.is_empty() {
+                    options.out_tif = Some(v);
                 }
             }
             "-cs1" => options.color_space = 1,

@@ -1920,3 +1920,174 @@ mod tests {
         assert_eq!(info.predictor, cpNullPredictor);
     }
 }
+
+/// `WriteTIFF` subset (dng_image_writer.cpp:6653/6816) — uncompressed TIFF
+/// with ICC profile support for the stage-dump use case (`dng_validate`
+/// `-1/-2/-3` dumps).  The C++ version additionally supports JPEG/JXL/deflate
+/// compression, thumbnails, resolution blocks, gain-map sub-IFDs, full
+/// EXIF/IPTC/Adobe tag sets and BigTIFF fallback; those paths are not part
+/// of this subset (see PORTING_NOTES).
+pub struct TiffWriteOptions<'a> {
+    /// `photometricInterpretation` (e.g. piRGB / piBlackIsZero).
+    pub photometric: uint32,
+    /// ICC profile bytes (embedded via tcICCProfile, 34675).
+    pub icc_profile: Option<&'a [uint8]>,
+    /// Software string (tcSoftware, 305).
+    pub software: Option<&'a str>,
+}
+
+impl DngImageWriter {
+    pub fn write_tiff_basic(
+        &mut self,
+        stream: &mut DngStream,
+        image: &dyn DngImage,
+        options: &TiffWriteOptions<'_>,
+    ) -> DngResult<()> {
+        let mut main_ifd = dng_core::dng_tiff_directory::DngTiffDirectory::new();
+
+        let width = image.width();
+        let height = image.height();
+        let planes = image.planes();
+        let pixel_type = image.pixel_type();
+
+        let bits_per_sample = match pixel_type {
+            t if t == ttByte => 8u32,
+            t if t == ttShort => 16,
+            t if t == ttFloat => 32,
+            _ => return Err(dng_core::dng_exceptions::bad_format()),
+        };
+
+        let mut encoded: Vec<uint8> = Vec::new();
+
+        match pixel_type {
+            t if t == ttFloat => {
+                let floats = image_samples_f32(image, image.bounds())?;
+
+                for f in &floats {
+                    encoded.extend_from_slice(&f.to_le_bytes());
+                }
+            }
+            t if t == ttShort => {
+                let samples = image_samples_u16(image, image.bounds())?;
+
+                for sample in &samples {
+                    encoded.extend_from_slice(&sample.to_le_bytes());
+                }
+            }
+            _ => {
+                let samples = image_samples_u16(image, image.bounds())?;
+
+                for sample in &samples {
+                    encoded.push(*sample as uint8);
+                }
+            }
+        }
+
+        let encode_count = encoded.len() as uint64;
+
+        let mut ifd = dng_core::dng_ifd::DngIfd::new();
+
+        ifd.image_width = width;
+        ifd.image_length = height;
+        ifd.samples_per_pixel = planes;
+        ifd.compression = ccUncompressed;
+        ifd.photometric_interpretation = options.photometric;
+
+        for plane in 0..planes as usize {
+            ifd.bits_per_sample[plane] = bits_per_sample;
+        }
+
+        ifd.set_single_strip();
+
+        let _ = &mut ifd;
+
+        // Basic IFD tags.
+
+        main_ifd.add(Box::new(TagUint32::new(tcNewSubFileType as uint16, 0)));
+        main_ifd.add(Box::new(TagUint32::new(tcImageWidth as uint16, width)));
+        main_ifd.add(Box::new(TagUint32::new(tcImageLength as uint16, height)));
+
+        if planes == 1 {
+            main_ifd.add(Box::new(TagUint16::new(
+                tcBitsPerSample as uint16,
+                bits_per_sample as uint16,
+            )));
+        } else {
+            main_ifd.add(Box::new(TagUint16Ptr::new(
+                tcBitsPerSample as uint16,
+                vec![bits_per_sample as uint16; planes as usize],
+            )));
+        }
+
+        main_ifd.add(Box::new(TagUint16::new(
+            tcCompression as uint16,
+            ccUncompressed as uint16,
+        )));
+        main_ifd.add(Box::new(TagUint16::new(
+            tcPhotometricInterpretation as uint16,
+            options.photometric as uint16,
+        )));
+
+        if planes > 1 {
+            main_ifd.add(Box::new(TagUint16::new(
+                tcSamplesPerPixel as uint16,
+                planes as uint16,
+            )));
+            main_ifd.add(Box::new(TagUint16::new(
+                tcPlanarConfiguration as uint16,
+                1, // pcInterleaved
+            )));
+        }
+
+        if let Some(software) = options.software {
+            main_ifd.add(Box::new(TagString::new(
+                tcSoftware as uint16,
+                DngString::from_bytes(software.as_bytes()),
+            )));
+        }
+
+        main_ifd.add(Box::new(u64s_tag(tcStripOffsets, vec![0]))); // patched below
+        main_ifd.add(Box::new(u64s_tag(tcStripByteCounts, vec![encode_count])));
+
+        if let Some(profile) = options.icc_profile {
+            main_ifd.add(Box::new(TagOwnedDataPtr::new(
+                dng_core::dng_tags::tcICCProfile as uint16,
+                dng_core::dng_tag_types::ttByte as uint16,
+                profile.len() as uint32,
+                std::sync::Arc::new(profile.to_vec()),
+            )));
+        }
+
+        // Layout: header(8) | IFD (+value area) | image data.
+
+        let ifd0_offset: uint64 = 8;
+
+        let ifd0_size = main_ifd.size()? as uint64;
+
+        let data_offset = ifd0_offset + ifd0_size;
+
+        main_ifd.set_tag_u64_values(tcStripOffsets as uint16, &[data_offset]);
+
+        // Emit.
+
+        stream.set_write_position(0)?;
+
+        stream.put_uint16(0x4949)?; // "II"
+        stream.put_uint16(42)?;
+        stream.put_uint32(ifd0_offset as uint32)?;
+
+        main_ifd.put(
+            stream,
+            dng_core::dng_tiff_directory::offsetsRelativeToStream,
+            0,
+        )?;
+
+        stream.set_write_position(data_offset)?;
+
+        stream.put(&encoded)?;
+
+        stream.flush()?;
+
+        Ok(())
+    }
+}
