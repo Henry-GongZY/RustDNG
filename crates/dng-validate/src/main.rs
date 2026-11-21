@@ -244,8 +244,10 @@ fn validate_file(options: &Options, path: &str) -> dng_core::DngResult<()> {
             &*stage3_img,
             &dng_sdk::dng_image_writer::TiffWriteOptions {
                 photometric,
+                compression: dng_core::dng_tag_values::ccUncompressed,
                 icc_profile: None,
                 software: Some("RustDNG dng-validate"),
+                metadata: Some(&negative.metadata),
             },
         )?;
 

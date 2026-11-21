@@ -217,6 +217,13 @@ impl TiffTag for TagUint32 {
     fn code(&self) -> uint16 {
         self.code
     }
+    fn set_u64_values(&mut self, values: &[uint64]) -> bool {
+        if values.is_empty() {
+            return false;
+        }
+        self.value = values[0] as uint32;
+        true
+    }
     fn tag_type(&self) -> uint16 {
         ttLong as uint16
     }

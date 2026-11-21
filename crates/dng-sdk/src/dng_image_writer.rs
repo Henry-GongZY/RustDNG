@@ -1614,7 +1614,7 @@ mod tests {
 
         // Write the DNG.
 
-        let mut memory = DngMemoryStream::new();
+        let mut memory = dng_core::dng_memory_stream::DngMemoryStream::new();
 
         let mut stream = memory.stream();
 
@@ -1930,10 +1930,15 @@ mod tests {
 pub struct TiffWriteOptions<'a> {
     /// `photometricInterpretation` (e.g. piRGB / piBlackIsZero).
     pub photometric: uint32,
+    /// Compression (ccUncompressed or ccDeflate; PORT-NOTE: the C++ also
+    /// supports JPEG/JXL here through WriteTile).
+    pub compression: uint32,
     /// ICC profile bytes (embedded via tcICCProfile, 34675).
     pub icc_profile: Option<&'a [uint8]>,
     /// Software string (tcSoftware, 305).
     pub software: Option<&'a str>,
+    /// Metadata (EXIF tag set + XMP + IPTC).
+    pub metadata: Option<&'a crate::dng_negative::DngMetadata>,
 }
 
 impl DngImageWriter {
@@ -2089,5 +2094,1362 @@ impl DngImageWriter {
         stream.flush()?;
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EXIF tag set (dng_image_writer.cpp:1003, 857 lines).
+// ---------------------------------------------------------------------------
+
+/// EXIF date string: "YYYY:MM:DD HH:MM:SS" (empty when invalid).
+fn format_exif_date_time(dt: &dng_core::dng_date_time::DngDateTime) -> String {
+    if !dt.is_valid() {
+        return String::new();
+    }
+
+    format!(
+        "{:04}:{:02}:{:02} {:02}:{:02}:{:02}",
+        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
+    )
+}
+
+/// Output of `build_exif_tag_set`: the EXIF IFD and GPS IFD directories
+/// (the C++ exif_tag_set object; the caller adds tcExifIFD / tcGPSInfo
+/// pointer tags and offsets, mirroring AddLinks + Locate).
+pub struct ExifTagSetOutput {
+    pub exif_ifd: dng_core::dng_tiff_directory::DngTiffDirectory,
+    pub gps_ifd: dng_core::dng_tiff_directory::DngTiffDirectory,
+}
+
+/// Port of `exif_tag_set` (dng_image_writer.cpp:1003) — builds the EXIF IFD
+/// and GPS IFD from a `DngExif`, adding TIFF-EP-only tags to the main
+/// directory when `inside_dng`.
+#[allow(clippy::too_many_lines)]
+pub fn build_exif_tag_set(
+    directory: &mut dng_core::dng_tiff_directory::DngTiffDirectory,
+    exif: &crate::dng_exif::DngExif,
+    maker_note_safe: bool,
+    maker_note_data: &[uint8],
+    inside_dng: bool,
+) -> DngResult<ExifTagSetOutput> {
+    let mut exif_ifd = dng_core::dng_tiff_directory::DngTiffDirectory::new();
+    let mut gps_ifd = dng_core::dng_tiff_directory::DngTiffDirectory::new();
+
+    use dng_core::dng_tags as tags;
+    use dng_core::dng_tag_types as tt;
+
+    macro_rules! owned_undef {
+        ($code:expr, $data:expr) => {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagOwnedDataPtr::new(
+                $code as uint16,
+                tt::ttUndefined as uint16,
+                $data.len() as uint32,
+                std::sync::Arc::new($data),
+            )))
+        };
+    }
+
+    // ExifVersion.
+
+    if exif.exif_version != 0 {
+        let data: Vec<uint8> = vec![
+            (exif.exif_version >> 24) as uint8,
+            (exif.exif_version >> 16) as uint8,
+            (exif.exif_version >> 8) as uint8,
+            exif.exif_version as uint8,
+        ];
+
+        owned_undef!(tags::tcExifVersion, data);
+    }
+
+    // Rational exposure tags.
+
+    if exif.exposure_time.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcExposureTime as uint16,
+            exif.exposure_time.n,
+            exif.exposure_time.d,
+        )));
+    }
+
+    if exif.shutter_speed_value.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagSRationalPtr::new(
+            tags::tcShutterSpeedValue as uint16,
+            vec![(exif.shutter_speed_value.n, exif.shutter_speed_value.d)],
+        )));
+    }
+
+    if exif.fnumber.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcFNumber as uint16,
+            exif.fnumber.n,
+            exif.fnumber.d,
+        )));
+    }
+
+    if exif.aperture_value.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagSRationalPtr::new(
+            tags::tcApertureValue as uint16,
+            vec![
+                (exif.aperture_value.n as int32, exif.aperture_value.d as int32)
+            ],
+        )));
+    }
+
+    if exif.brightness_value.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagSRationalPtr::new(
+            tags::tcBrightnessValue as uint16,
+            vec![(exif.brightness_value.n, exif.brightness_value.d)],
+        )));
+    }
+
+    if exif.exposure_bias_value.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagSRationalPtr::new(
+            tags::tcExposureBiasValue as uint16,
+            vec![(exif.exposure_bias_value.n, exif.exposure_bias_value.d)],
+        )));
+    }
+
+    if exif.max_aperture_value.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagSRationalPtr::new(
+            tags::tcMaxApertureValue as uint16,
+            vec![(
+                exif.max_aperture_value.n as int32,
+                exif.max_aperture_value.d as int32
+            )],
+        )));
+    }
+
+    if exif.subject_distance.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcSubjectDistance as uint16,
+            exif.subject_distance.n,
+            exif.subject_distance.d,
+        )));
+    }
+
+    if exif.focal_length.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcFocalLength as uint16,
+            exif.focal_length.n,
+            exif.focal_length.d,
+        )));
+    }
+
+    if exif.iso_speed_ratings[0] != 0 {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcISOSpeedRatings as uint16,
+            dng_core::dng_utils::min_uint32(65535, exif.iso_speed_ratings[0]) as uint16,
+        )));
+    }
+
+    if exif.flash <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcFlash as uint16,
+            exif.flash as uint16,
+        )));
+    }
+
+    if exif.exposure_program <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcExposureProgram as uint16,
+            exif.exposure_program as uint16,
+        )));
+    }
+
+    if exif.metering_mode <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcMeteringMode as uint16,
+            exif.metering_mode as uint16,
+        )));
+    }
+
+    if exif.light_source <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcLightSource as uint16,
+            exif.light_source as uint16,
+        )));
+    }
+
+    if exif.sensing_method <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcSensingMethodExif as uint16,
+            exif.sensing_method as uint16,
+        )));
+    }
+
+    if exif.focal_length_in_35mm_film != 0 {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcFocalLengthIn35mmFilm as uint16,
+            exif.focal_length_in_35mm_film as uint16,
+        )));
+    }
+
+    if exif.file_source <= 0x0FF {
+        owned_undef!(tags::tcFileSource, vec![exif.file_source as uint8]);
+    }
+
+    if exif.scene_type <= 0x0FF {
+        owned_undef!(tags::tcSceneType, vec![exif.scene_type as uint8]);
+    }
+
+    if exif.cfa_repeat_pattern_rows != 0 && exif.cfa_repeat_pattern_cols != 0 {
+        // tag_cfa_pattern: ttUndefined, 4 + rows*cols bytes
+        // ([rows SHORT][cols SHORT][pattern bytes]).
+
+        let rows = exif.cfa_repeat_pattern_rows as usize;
+        let cols = exif.cfa_repeat_pattern_cols as usize;
+
+        let mut data: Vec<uint8> = Vec::with_capacity(4 + rows * cols);
+
+        data.extend_from_slice(&(exif.cfa_repeat_pattern_rows as uint16).to_le_bytes());
+        data.extend_from_slice(&(exif.cfa_repeat_pattern_cols as uint16).to_le_bytes());
+
+        for r in 0..rows {
+            for c in 0..cols {
+                data.push(exif.cfa_pattern[r][c]);
+            }
+        }
+
+        owned_undef!(tags::tcCFAPatternExif, data);
+    }
+
+    if exif.custom_rendered <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcCustomRendered as uint16,
+            exif.custom_rendered as uint16,
+        )));
+    }
+
+    if exif.exposure_mode <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcExposureMode as uint16,
+            exif.exposure_mode as uint16,
+        )));
+    }
+
+    if exif.white_balance <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcWhiteBalance as uint16,
+            exif.white_balance as uint16,
+        )));
+    }
+
+    if exif.scene_capture_type <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcSceneCaptureType as uint16,
+            exif.scene_capture_type as uint16,
+        )));
+    }
+
+    if exif.gain_control <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcGainControl as uint16,
+            exif.gain_control as uint16,
+        )));
+    }
+
+    if exif.contrast <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcContrast as uint16,
+            exif.contrast as uint16,
+        )));
+    }
+
+    if exif.saturation <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcSaturation as uint16,
+            exif.saturation as uint16,
+        )));
+    }
+
+    if exif.sharpness <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcSharpness as uint16,
+            exif.sharpness as uint16,
+        )));
+    }
+
+    if exif.subject_distance_range <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcSubjectDistanceRange as uint16,
+            exif.subject_distance_range as uint16,
+        )));
+    }
+
+    if exif.digital_zoom_ratio.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcDigitalZoomRatio as uint16,
+            exif.digital_zoom_ratio.n,
+            exif.digital_zoom_ratio.d,
+        )));
+    }
+
+    if exif.exposure_index.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcExposureIndexExif as uint16,
+            exif.exposure_index.n,
+            exif.exposure_index.d,
+        )));
+    }
+
+    // TIFF-EP only tags (insideDNG).
+
+    if inside_dng {
+        if exif.image_number != 0xFFFFFFFF {
+            directory.add(Box::new(dng_core::dng_tiff_directory::TagUint32::new(
+                tags::tcImageNumber as uint16,
+                exif.image_number,
+            )));
+        }
+
+        if exif.self_timer_mode <= 0x0FFFF {
+            directory.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+                tags::tcSelfTimerMode as uint16,
+                exif.self_timer_mode as uint16,
+            )));
+        }
+
+        if exif.battery_level_a.not_empty() {
+            directory.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcBatteryLevel as uint16,
+                exif.battery_level_a.clone(),
+            )));
+        } else if exif.battery_level_r.is_valid() {
+            directory.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+                tags::tcBatteryLevel as uint16,
+                exif.battery_level_r.n,
+                exif.battery_level_r.d,
+            )));
+        }
+    }
+
+    if exif.color_space == 1 || exif.color_space == 0xFFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcColorSpace as uint16,
+            exif.color_space as uint16,
+        )));
+    }
+
+    if exif.focal_plane_x_resolution.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcFocalPlaneXResolutionExif as uint16,
+            exif.focal_plane_x_resolution.n,
+            exif.focal_plane_x_resolution.d,
+        )));
+    }
+
+    if exif.focal_plane_y_resolution.is_valid() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcFocalPlaneYResolutionExif as uint16,
+            exif.focal_plane_y_resolution.n,
+            exif.focal_plane_y_resolution.d,
+        )));
+    }
+
+    if exif.focal_plane_resolution_unit <= 0x0FFFF {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcFocalPlaneResolutionUnitExif as uint16,
+            exif.focal_plane_resolution_unit as uint16,
+        )));
+    }
+
+    if exif.subject_area_count != 0 {
+        let data: Vec<uint8> = exif.subject_area[..4]
+            .iter()
+            .flat_map(|v| (*v as uint16).to_le_bytes())
+            .collect();
+
+        owned_undef!(tags::tcSubjectArea, data);
+    }
+
+    if exif.lens_info[0].is_valid() && exif.lens_info[1].is_valid() {
+        let data: Vec<(int32, int32)> = exif
+            .lens_info
+            .iter()
+            .map(|r| (r.n as int32, r.d as int32))
+            .collect();
+
+        if inside_dng {
+            directory.add(Box::new(
+                dng_core::dng_tiff_directory::TagSRationalPtr::new(
+                    tags::tcLensInfo as uint16,
+                    data,
+                ),
+            ));
+        }
+    }
+
+    // Date-time tags (main directory for DateTime; EXIF for the rest).
+
+    if exif.date_time.is_valid() {
+        let text = format_exif_date_time(&exif.date_time.date_time());
+
+        directory.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcDateTime as uint16,
+            DngString::from_bytes(text.as_bytes()),
+        )));
+
+        if exif.date_time.subseconds().not_empty() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcSubsecTime as uint16,
+                exif.date_time.subseconds().clone(),
+            )));
+        }
+    }
+
+    if exif.date_time_original.is_valid() {
+        let text = format_exif_date_time(&exif.date_time_original.date_time());
+
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcDateTimeOriginal as uint16,
+            DngString::from_bytes(text.as_bytes()),
+        )));
+
+        if exif.date_time_original.subseconds().not_empty() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcSubsecTimeOriginal as uint16,
+                exif.date_time_original.subseconds().clone(),
+            )));
+        }
+    }
+
+    if exif.date_time_digitized.is_valid() {
+        let text = format_exif_date_time(&exif.date_time_digitized.date_time());
+
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcDateTimeDigitized as uint16,
+            DngString::from_bytes(text.as_bytes()),
+        )));
+
+        if exif.date_time_digitized.subseconds().not_empty() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcSubsecTimeDigitized as uint16,
+                exif.date_time_digitized.subseconds().clone(),
+            )));
+        }
+    }
+
+    if exif.make.not_empty() {
+        directory.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcMake as uint16,
+            exif.make.clone(),
+        )));
+    }
+
+    if exif.model.not_empty() {
+        directory.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcModel as uint16,
+            exif.model.clone(),
+        )));
+    }
+
+    if exif.artist.not_empty() {
+        directory.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcArtist as uint16,
+            exif.artist.clone(),
+        )));
+    }
+
+    if exif.software.not_empty() {
+        directory.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcSoftware as uint16,
+            exif.software.clone(),
+        )));
+    }
+
+    if exif.copyright.not_empty() {
+        directory.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcCopyright as uint16,
+            exif.copyright.clone(),
+        )));
+    }
+
+    if exif.image_description.not_empty() {
+        directory.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcImageDescription as uint16,
+            exif.image_description.clone(),
+        )));
+    }
+
+    if exif.camera_serial_number.not_empty() && inside_dng {
+        directory.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcCameraSerialNumber as uint16,
+            exif.camera_serial_number.clone(),
+        )));
+    }
+
+    if maker_note_safe && !maker_note_data.is_empty() {
+        directory.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcMakerNoteSafety as uint16,
+            1,
+        )));
+
+        owned_undef!(tags::tcMakerNote, maker_note_data.to_vec());
+    }
+
+    if exif.user_comment.not_empty() {
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagEncodedText::new(
+            tags::tcUserComment as uint16,
+            &exif.user_comment,
+        )));
+    }
+
+    if exif.image_unique_id.is_valid() {
+        let mut hex = String::with_capacity(32);
+
+        for byte in exif.image_unique_id.data.iter() {
+            hex.push_str(&format!("{:02X}", byte));
+        }
+
+        exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcImageUniqueID as uint16,
+            DngString::from_bytes(hex.as_bytes()),
+        )));
+    }
+
+    // Version 0230 tags.
+
+    if exif.at_least_version_0230() {
+        if exif.sensitivity_type != 0 {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+                tags::tcSensitivityType as uint16,
+                exif.sensitivity_type as uint16,
+            )));
+        }
+
+        if exif.sensitivity_type != 0 && exif.iso_speed_ratings[0] != 0 {
+            if exif.standard_output_sensitivity != 0 {
+                exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint32::new(
+                    tags::tcStandardOutputSensitivity as uint16,
+                    exif.standard_output_sensitivity,
+                )));
+            }
+
+            if exif.recommended_exposure_index != 0 {
+                exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint32::new(
+                    tags::tcRecommendedExposureIndex as uint16,
+                    exif.recommended_exposure_index,
+                )));
+            }
+
+            if exif.iso_speed != 0 {
+                exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint32::new(
+                    tags::tcISOSpeed as uint16,
+                    exif.iso_speed,
+                )));
+
+                if exif.iso_speed_latitude_yyy != 0 && exif.iso_speed_latitude_zzz != 0 {
+                    exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint32::new(
+                        tags::tcISOSpeedLatitudeyyy as uint16,
+                        exif.iso_speed_latitude_yyy,
+                    )));
+                    exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint32::new(
+                        tags::tcISOSpeedLatitudezzz as uint16,
+                        exif.iso_speed_latitude_zzz,
+                    )));
+                }
+            }
+        }
+
+        if exif.owner_name.not_empty() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcCameraOwnerNameExif as uint16,
+                exif.owner_name.clone(),
+            )));
+        }
+
+        if exif.camera_serial_number.not_empty() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcCameraSerialNumberExif as uint16,
+                exif.camera_serial_number.clone(),
+            )));
+        }
+
+        if exif.lens_info[0].is_valid() && exif.lens_info[1].is_valid() {
+            let data: Vec<(int32, int32)> = exif
+                .lens_info
+                .iter()
+                .map(|r| (r.n as int32, r.d as int32))
+                .collect();
+
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagSRationalPtr::new(
+                tags::tcLensSpecificationExif as uint16,
+                data,
+            )));
+        }
+
+        if exif.lens_make.not_empty() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcLensMakeExif as uint16,
+                exif.lens_make.clone(),
+            )));
+        }
+
+        if exif.lens_name.not_empty() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcLensModelExif as uint16,
+                exif.lens_name.clone(),
+            )));
+        }
+
+        if exif.lens_serial_number.not_empty() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcLensSerialNumberExif as uint16,
+                exif.lens_serial_number.clone(),
+            )));
+        }
+    }
+
+    // Version 0231 tags (environment / offset times).
+
+    if exif.at_least_version_0231() {
+        if exif.date_time.is_valid() && exif.date_time.time_zone().is_valid() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcOffsetTime as uint16,
+                exif.date_time.offset_time(),
+            )));
+        }
+
+        if exif.date_time_original.is_valid()
+            && exif.date_time_original.time_zone().is_valid()
+        {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcOffsetTimeOriginal as uint16,
+                exif.date_time_original.offset_time(),
+            )));
+        }
+
+        if exif.date_time_digitized.is_valid()
+            && exif.date_time_digitized.time_zone().is_valid()
+        {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+                tags::tcOffsetTimeDigitized as uint16,
+                exif.date_time_digitized.offset_time(),
+            )));
+        }
+
+        if exif.temperature.is_valid() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagSRationalPtr::new(
+                tags::tcTemperature as uint16,
+                vec![(exif.temperature.n, exif.temperature.d)],
+            )));
+        }
+
+        if exif.humidity.is_valid() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+                tags::tcHumidity as uint16,
+                exif.humidity.n,
+                exif.humidity.d,
+            )));
+        }
+
+        if exif.pressure.is_valid() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+                tags::tcPressure as uint16,
+                exif.pressure.n,
+                exif.pressure.d,
+            )));
+        }
+
+        if exif.water_depth.is_valid() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagSRationalPtr::new(
+                tags::tcWaterDepth as uint16,
+                vec![(exif.water_depth.n, exif.water_depth.d)],
+            )));
+        }
+
+        if exif.acceleration.is_valid() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+                tags::tcAcceleration as uint16,
+                exif.acceleration.n,
+                exif.acceleration.d,
+            )));
+        }
+
+        if exif.camera_elevation_angle.is_valid() {
+            exif_ifd.add(Box::new(dng_core::dng_tiff_directory::TagSRationalPtr::new(
+                tags::tcCameraElevationAngle as uint16,
+                vec![(exif.camera_elevation_angle.n, exif.camera_elevation_angle.d)],
+            )));
+        }
+    }
+
+    // GPS IFD.
+
+    if exif.gps_version_id != 0 {
+        let data: Vec<uint8> = vec![
+            (exif.gps_version_id >> 24) as uint8,
+            (exif.gps_version_id >> 16) as uint8,
+            (exif.gps_version_id >> 8) as uint8,
+            exif.gps_version_id as uint8,
+        ];
+
+        owned_undef!(tags::tcGPSVersionID, data);
+    }
+
+    if exif.gps_latitude_ref.not_empty() && exif.gps_latitude[0].is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSLatitudeRef as uint16,
+            exif.gps_latitude_ref.clone(),
+        )));
+
+        let data: Vec<(uint32, uint32)> =
+            exif.gps_latitude.iter().map(|r| (r.n, r.d)).collect();
+
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURationalPtr::new(
+            tags::tcGPSLatitude as uint16,
+            data,
+        )));
+    }
+
+    if exif.gps_longitude_ref.not_empty() && exif.gps_longitude[0].is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSLongitudeRef as uint16,
+            exif.gps_longitude_ref.clone(),
+        )));
+
+        let data: Vec<(uint32, uint32)> =
+            exif.gps_longitude.iter().map(|r| (r.n, r.d)).collect();
+
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURationalPtr::new(
+            tags::tcGPSLongitude as uint16,
+            data,
+        )));
+    }
+
+    if exif.gps_altitude_ref <= 0x0FF {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagOwnedDataPtr::new(
+            tags::tcGPSAltitudeRef as uint16,
+            tt::ttByte as uint16,
+            1,
+            std::sync::Arc::new(vec![exif.gps_altitude_ref as uint8]),
+        )));
+    }
+
+    if exif.gps_altitude.is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcGPSAltitude as uint16,
+            exif.gps_altitude.n,
+            exif.gps_altitude.d,
+        )));
+    }
+
+    if exif.gps_time_stamp[0].is_valid() {
+        let data: Vec<(uint32, uint32)> =
+            exif.gps_time_stamp.iter().map(|r| (r.n, r.d)).collect();
+
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURationalPtr::new(
+            tags::tcGPSTimeStamp as uint16,
+            data,
+        )));
+    }
+
+    if exif.gps_satellites.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSSatellites as uint16,
+            exif.gps_satellites.clone(),
+        )));
+    }
+
+    if exif.gps_status.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSStatus as uint16,
+            exif.gps_status.clone(),
+        )));
+    }
+
+    if exif.gps_measure_mode.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSMeasureMode as uint16,
+            exif.gps_measure_mode.clone(),
+        )));
+    }
+
+    if exif.gps_dop.is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcGPSDOP as uint16,
+            exif.gps_dop.n,
+            exif.gps_dop.d,
+        )));
+    }
+
+    if exif.gps_speed_ref.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSSpeedRef as uint16,
+            exif.gps_speed_ref.clone(),
+        )));
+    }
+
+    if exif.gps_speed.is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcGPSSpeed as uint16,
+            exif.gps_speed.n,
+            exif.gps_speed.d,
+        )));
+    }
+
+    if exif.gps_track_ref.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSTrackRef as uint16,
+            exif.gps_track_ref.clone(),
+        )));
+    }
+
+    if exif.gps_track.is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcGPSTrack as uint16,
+            exif.gps_track.n,
+            exif.gps_track.d,
+        )));
+    }
+
+    if exif.gps_img_direction_ref.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSImgDirectionRef as uint16,
+            exif.gps_img_direction_ref.clone(),
+        )));
+    }
+
+    if exif.gps_img_direction.is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcGPSImgDirection as uint16,
+            exif.gps_img_direction.n,
+            exif.gps_img_direction.d,
+        )));
+    }
+
+    if exif.gps_map_datum.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSMapDatum as uint16,
+            exif.gps_map_datum.clone(),
+        )));
+    }
+
+    if exif.gps_dest_latitude_ref.not_empty() && exif.gps_dest_latitude[0].is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSDestLatitudeRef as uint16,
+            exif.gps_dest_latitude_ref.clone(),
+        )));
+
+        let data: Vec<(uint32, uint32)> = exif
+            .gps_dest_latitude
+            .iter()
+            .map(|r| (r.n, r.d))
+            .collect();
+
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURationalPtr::new(
+            tags::tcGPSDestLatitude as uint16,
+            data,
+        )));
+    }
+
+    if exif.gps_dest_longitude_ref.not_empty() && exif.gps_dest_longitude[0].is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSDestLongitudeRef as uint16,
+            exif.gps_dest_longitude_ref.clone(),
+        )));
+
+        let data: Vec<(uint32, uint32)> = exif
+            .gps_dest_longitude
+            .iter()
+            .map(|r| (r.n, r.d))
+            .collect();
+
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURationalPtr::new(
+            tags::tcGPSDestLongitude as uint16,
+            data,
+        )));
+    }
+
+    if exif.gps_dest_bearing_ref.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSDestBearingRef as uint16,
+            exif.gps_dest_bearing_ref.clone(),
+        )));
+    }
+
+    if exif.gps_dest_bearing.is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcGPSDestBearing as uint16,
+            exif.gps_dest_bearing.n,
+            exif.gps_dest_bearing.d,
+        )));
+    }
+
+    if exif.gps_dest_distance_ref.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSDestDistanceRef as uint16,
+            exif.gps_dest_distance_ref.clone(),
+        )));
+    }
+
+    if exif.gps_dest_distance.is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcGPSDestDistance as uint16,
+            exif.gps_dest_distance.n,
+            exif.gps_dest_distance.d,
+        )));
+    }
+
+    if exif.gps_processing_method.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagEncodedText::new(
+            tags::tcGPSProcessingMethod as uint16,
+            &exif.gps_processing_method,
+        )));
+    }
+
+    if exif.gps_area_information.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagEncodedText::new(
+            tags::tcGPSAreaInformation as uint16,
+            &exif.gps_area_information,
+        )));
+    }
+
+    if exif.gps_date_stamp.not_empty() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagString::new(
+            tags::tcGPSDateStamp as uint16,
+            exif.gps_date_stamp.clone(),
+        )));
+    }
+
+    if exif.gps_differential <= 0x0FFFF {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagUint16::new(
+            tags::tcGPSDifferential as uint16,
+            exif.gps_differential as uint16,
+        )));
+    }
+
+    if exif.at_least_version_0230() && exif.gps_h_positioning_error.is_valid() {
+        gps_ifd.add(Box::new(dng_core::dng_tiff_directory::TagURational::new(
+            tags::tcGPSHPositioningError as uint16,
+            exif.gps_h_positioning_error.n,
+            exif.gps_h_positioning_error.d,
+        )));
+    }
+
+    // AddLinks: tcExifIFD / tcGPSInfo pointer placeholders in the main
+    // directory (offsets patched by the caller after layout).
+
+    if !exif_ifd.is_empty() {
+        directory.add(Box::new(dng_core::dng_tiff_directory::TagUint32::new(
+            tags::tcExifIFD as uint16,
+            0,
+        )));
+    }
+
+    if !gps_ifd.is_empty() {
+        directory.add(Box::new(dng_core::dng_tiff_directory::TagUint32::new(
+            tags::tcGPSInfo as uint16,
+            0,
+        )));
+    }
+
+    Ok(ExifTagSetOutput { exif_ifd, gps_ifd })
+}
+
+impl DngImageWriter {
+    /// Full `WriteTIFF` port (dng_image_writer.cpp:6653/6816) — supports
+    /// uncompressed + deflate with predictors, the EXIF tag set, XMP/IPTC
+    /// blocks and ICC profiles.  PORT-NOTEs: JPEG/JXL compression, gain-map
+    /// sub-IFDs, thumbnails, resolution blocks, Adobe data and the
+    /// BigTIFF fallback are not ported (documented in PORTING_NOTES).
+    pub fn write_tiff(
+        &mut self,
+        stream: &mut DngStream,
+        image: &dyn DngImage,
+        options: &TiffWriteOptions<'_>,
+    ) -> DngResult<()> {
+        let mut main_ifd = dng_core::dng_tiff_directory::DngTiffDirectory::new();
+
+        let width = image.width();
+        let height = image.height();
+        let planes = image.planes();
+        let pixel_type = image.pixel_type();
+
+        let bits_per_sample = match pixel_type {
+            t if t == ttByte => 8u32,
+            t if t == ttShort => 16,
+            t if t == ttFloat => 32,
+            _ => return Err(dng_core::dng_exceptions::bad_format()),
+        };
+
+        let compression = match options.compression {
+            c if c == ccUncompressed || c == ccDeflate => c,
+            other => {
+                return Err(dng_core::DngError::Unsupported(format!(
+                    "TIFF compression {other} not supported (PORT-NOTE)"
+                )))
+            }
+        };
+
+        // Pre-encode the image data (compression + predictor).
+
+        let encoded: Vec<uint8> = {
+            let mut ifd = dng_core::dng_ifd::DngIfd::new();
+
+            ifd.image_width = width;
+            ifd.image_length = height;
+            ifd.samples_per_pixel = planes;
+            ifd.compression = compression;
+
+            if compression == ccDeflate {
+                ifd.predictor = if pixel_type == ttFloat {
+                    cpFloatingPoint
+                } else {
+                    cpHorizontalDifference
+                };
+            }
+
+            let mut sink = dng_core::dng_memory_stream::DngMemoryStream::new();
+
+            let mut encode_stream = sink.stream();
+
+            self.encode_raw_image(image, &ifd, &mut encode_stream)?;
+
+            encode_stream.flush()?;
+
+            encode_stream.set_read_position(0)?;
+
+            let length = encode_stream.length() as uint32;
+
+            encode_stream.get(length)?
+        };
+
+        let encode_count = encoded.len() as uint64;
+
+        // Main IFD tags.
+
+        main_ifd.add(Box::new(TagUint32::new(tcNewSubFileType as uint16, 0)));
+        main_ifd.add(Box::new(TagUint32::new(tcImageWidth as uint16, width)));
+        main_ifd.add(Box::new(TagUint32::new(tcImageLength as uint16, height)));
+
+        if planes == 1 {
+            main_ifd.add(Box::new(TagUint16::new(
+                tcBitsPerSample as uint16,
+                bits_per_sample as uint16,
+            )));
+        } else {
+            main_ifd.add(Box::new(TagUint16Ptr::new(
+                tcBitsPerSample as uint16,
+                vec![bits_per_sample as uint16; planes as usize],
+            )));
+        }
+
+        main_ifd.add(Box::new(TagUint16::new(
+            tcCompression as uint16,
+            compression as uint16,
+        )));
+        main_ifd.add(Box::new(TagUint16::new(
+            tcPhotometricInterpretation as uint16,
+            options.photometric as uint16,
+        )));
+
+        if compression == ccDeflate && pixel_type == ttFloat {
+            main_ifd.add(Box::new(TagUint16::new(
+                tcPredictor as uint16,
+                cpFloatingPoint as uint16,
+            )));
+        } else if compression == ccDeflate {
+            main_ifd.add(Box::new(TagUint16::new(
+                tcPredictor as uint16,
+                cpHorizontalDifference as uint16,
+            )));
+        }
+
+        if planes > 1 {
+            main_ifd.add(Box::new(TagUint16::new(
+                tcSamplesPerPixel as uint16,
+                planes as uint16,
+            )));
+            main_ifd.add(Box::new(TagUint16::new(
+                tcPlanarConfiguration as uint16,
+                1, // pcInterleaved
+            )));
+
+            if pixel_type == ttFloat {
+                main_ifd.add(Box::new(TagUint16Ptr::new(
+                    tcSampleFormat as uint16,
+                    vec![sfFloatingPoint as uint16; planes as usize],
+                )));
+            }
+        }
+
+        if let Some(software) = options.software {
+            main_ifd.add(Box::new(TagString::new(
+                tcSoftware as uint16,
+                DngString::from_bytes(software.as_bytes()),
+            )));
+        }
+
+        main_ifd.add(Box::new(u64s_tag(tcStripOffsets, vec![0]))); // patched below
+        main_ifd.add(Box::new(u64s_tag(tcStripByteCounts, vec![encode_count])));
+
+        if let Some(profile) = options.icc_profile {
+            main_ifd.add(Box::new(TagOwnedDataPtr::new(
+                dng_core::dng_tags::tcICCProfile as uint16,
+                dng_core::dng_tag_types::ttByte as uint16,
+                profile.len() as uint32,
+                std::sync::Arc::new(profile.to_vec()),
+            )));
+        }
+
+        // Metadata: EXIF tag set (+ TIFF-EP tags into the main IFD), XMP and
+        // IPTC blocks.
+
+        let mut exif_output: Option<ExifTagSetOutput> = None;
+
+        if let Some(metadata) = options.metadata {
+            let maker_note_data = if metadata.is_maker_note_safe() {
+                metadata.maker_note_data().unwrap_or(&[])
+            } else {
+                &[]
+            };
+
+            let output = build_exif_tag_set(
+                &mut main_ifd,
+                &metadata.exif,
+                metadata.is_maker_note_safe(),
+                maker_note_data,
+                false, // insideDNG: TIFF output keeps TIFF-EP tags out
+            )?;
+
+            exif_output = Some(output);
+
+            // XMP packet (IFD0).
+
+            if metadata.xmp.has_meta() {
+                let xmp_block = metadata.xmp.serialize(true, 0, 0, false, false)?;
+
+                if xmp_block.logical_size() > 0 {
+                    main_ifd.add(Box::new(owned_tag(
+                        dng_core::dng_tags::tcXMP,
+                        ttByte,
+                        xmp_block.buffer().to_vec(),
+                    )));
+                }
+            }
+
+            // IPTC block (IFD0, ttLong, 4-byte padded).
+
+            if metadata.iptc_length() > 0 {
+                let mut bytes = metadata.iptc_data().unwrap_or(&[]).to_vec();
+
+                let padded = (bytes.len() + 3) & !3usize;
+
+                bytes.resize(padded, 0);
+
+                main_ifd.add(Box::new(owned_tag(tcIPTC_NAA, ttLong, bytes)));
+            }
+        }
+
+        // Layout: header(8) | IFD0 (+value area) | EXIF IFD | GPS IFD | data.
+
+        let ifd0_offset: uint64 = 8;
+
+        let ifd0_size = main_ifd.size()? as uint64;
+
+        let (exif_offset, gps_offset, data_offset) = match &exif_output {
+            Some(output) => {
+                let exif_size = output.exif_ifd.size()? as uint64;
+                let gps_size = output.gps_ifd.size()? as uint64;
+
+                let exif_offset = ifd0_offset + ifd0_size;
+                let gps_offset = exif_offset + exif_size;
+
+                (exif_offset, gps_offset, gps_offset + gps_size)
+            }
+            None => (0, 0, ifd0_offset + ifd0_size),
+        };
+
+        main_ifd.set_tag_u64_values(dng_core::dng_tags::tcExifIFD as uint16, &[exif_offset]);
+        main_ifd.set_tag_u64_values(dng_core::dng_tags::tcGPSInfo as uint16, &[gps_offset]);
+        main_ifd.set_tag_u64_values(tcStripOffsets as uint16, &[data_offset]);
+
+        // Emit.
+
+        stream.set_write_position(0)?;
+
+        stream.put_uint16(0x4949)?; // "II"
+        stream.put_uint16(42)?;
+        stream.put_uint32(ifd0_offset as uint32)?;
+
+        main_ifd.put(
+            stream,
+            dng_core::dng_tiff_directory::offsetsRelativeToStream,
+            0,
+        )?;
+
+        if let Some(output) = &exif_output {
+            output.exif_ifd.put(
+                stream,
+                dng_core::dng_tiff_directory::offsetsRelativeToStream,
+                0,
+            )?;
+
+            output.gps_ifd.put(
+                stream,
+                dng_core::dng_tiff_directory::offsetsRelativeToStream,
+                0,
+            )?;
+        }
+
+        stream.set_write_position(data_offset)?;
+
+        stream.put(&encoded)?;
+
+        stream.flush()?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod write_tiff_tests {
+    use super::*;
+
+    use dng_core::dng_simple_image::DngSimpleImage;
+    use dng_core::{DngURational, ImageRef};
+    use dng_core::dng_types::dng_char4;
+
+    #[test]
+    fn write_tiff_with_exif_round_trip() {
+        let mut host = DngHost::new();
+
+        let mut negative = DngNegative::new(&mut host).unwrap();
+
+        let width = 12u32;
+        let height = 9u32;
+
+        let bounds = DngRect::from_corners(0, 0, height as int32, width as int32);
+
+        let image: ImageRef = DngSimpleImage::new(bounds, 3, ttShort)
+            .unwrap()
+            .into_image_ref()
+            .unwrap();
+
+        {
+            let mut buffer = DngPixelBuffer::with_planar_config(
+                bounds,
+                0,
+                3,
+                ttShort,
+                pcInterleaved,
+                DngPixelBuffer::allocate_data(bounds, 3, ttShort).unwrap(),
+            )
+            .unwrap();
+
+            let samples = buffer.as_u16_slice_mut().unwrap();
+
+            for (index, sample) in samples.iter_mut().enumerate() {
+                *sample = ((index * 211) % 65535) as u16;
+            }
+
+            image.write().unwrap().do_put(&buffer).unwrap();
+        }
+
+        // Metadata: EXIF exposure + maker.
+
+        negative.metadata.exif.exposure_time = DngURational::new(1, 250);
+        negative.metadata.exif.fnumber = DngURational::new(28, 10);
+        negative.metadata.exif.iso_speed_ratings = [200, 0, 0];
+        negative.metadata.exif.make = DngString::from_bytes(b"RustDNG");
+        negative.metadata.exif.model = DngString::from_bytes(b"TestModel");
+        negative.metadata.exif.exif_version = dng_char4(b'0', b'2', b'3', b'0');
+
+        let mut tiff_bytes: Vec<uint8> = Vec::new();
+
+        {
+            let mut memory = dng_core::dng_memory_stream::DngMemoryStream::new();
+
+            let mut stream = memory.stream();
+
+            stream.set_big_endian(false);
+
+            let mut writer = DngImageWriter::new();
+
+            writer
+                .write_tiff(
+                    &mut stream,
+                    &*image.read().unwrap(),
+                    &TiffWriteOptions {
+                    photometric: dng_core::dng_tag_values::piRGB,
+                    compression: dng_core::dng_tag_values::ccUncompressed,
+                    icc_profile: None,
+                    software: Some("RustDNG test"),
+                    metadata: Some(&negative.metadata),
+                },
+                )
+                .unwrap();
+
+            stream.flush().unwrap();
+
+            stream.set_read_position(0).unwrap();
+
+            let length = stream.length() as uint32;
+
+            tiff_bytes = stream.get(length).unwrap();
+        }
+
+        let mut stream = dng_core::DngStream::from_static(&tiff_bytes, 0);
+
+        stream.set_big_endian(false);
+
+        // Walk the main IFD manually to find the EXIF IFD pointer.
+
+        stream.set_read_position(8).unwrap();
+
+        let main_entries = stream.get_uint16().unwrap();
+
+        let mut exif_ifd_offset: uint64 = 0;
+
+        for _ in 0..main_entries {
+            let code = stream.get_uint16().unwrap();
+
+            let _type_ = stream.get_uint16().unwrap();
+            let _count = stream.get_uint32().unwrap();
+
+            let value = stream.get_uint32().unwrap() as uint64;
+
+            if code as uint32 == dng_core::dng_tags::tcExifIFD {
+                exif_ifd_offset = value;
+            }
+        }
+
+        assert!(exif_ifd_offset != 0, "EXIF IFD pointer missing");
+
+        // Read the EXIF sub-IFD tags.
+
+        stream.set_read_position(exif_ifd_offset).unwrap();
+
+        let entry_count = stream.get_uint16().unwrap();
+
+        // DngExif defaults mark unknown enums as 0xFFFFFFFF which the C++
+        // skips via the `<= 0x0FFFF` checks — 4 tags here is the expected
+        // set (ExifVersion, ExposureTime, FNumber, ISOSpeedRatings).
+
+        assert!(entry_count >= 4, "EXIF IFD too sparse: {entry_count}");
+
+        let mut codes: Vec<uint32> = Vec::new();
+
+        for _ in 0..entry_count {
+            let code = stream.get_uint16().unwrap();
+
+            codes.push(code as uint32);
+
+            let _type_ = stream.get_uint16().unwrap();
+            let count = stream.get_uint32().unwrap();
+
+            // Skip value field (inline or offset).
+
+            let _ = stream.get(4).unwrap();
+
+            let _ = count;
+        }
+
+        assert!(codes.contains(&(dng_core::dng_tags::tcExposureTime as uint32)));
+        assert!(codes.contains(&(dng_core::dng_tags::tcFNumber as uint32)));
+        assert!(codes.contains(&(dng_core::dng_tags::tcISOSpeedRatings as uint32)));
+        assert!(codes.contains(&(dng_core::dng_tags::tcExifVersion as uint32)));
     }
 }
