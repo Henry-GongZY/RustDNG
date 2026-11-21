@@ -1598,8 +1598,12 @@ pub enum DngJxlUseCase {
     LosslessEnhancedImage,
     MergeResults,
     Transparency,
-    LosslessGainMap,
     LosslessTransparency,
+    Depth,
+    LosslessDepth,
+    SemanticMask,
+    LosslessSemanticMask,
+    LosslessGainMap,
 }
 
 impl DngJxlUseCase {
@@ -1646,6 +1650,12 @@ impl DngJxlUseCase {
                 (effort, if is_float { 1.0 } else { 0.0 })
             }
             DngJxlUseCase::LosslessTransparency => (effort, 0.0),
+            DngJxlUseCase::Depth => (effort, 0.5),
+            DngJxlUseCase::LosslessDepth => (effort, 0.0),
+            DngJxlUseCase::SemanticMask => {
+                (effort, if is_float { 0.5 } else { 0.1 })
+            }
+            DngJxlUseCase::LosslessSemanticMask => (effort, 0.0),
         }
     }
 }
@@ -6899,12 +6909,17 @@ impl DngNegative {
         }
 
         // Transparency mask (C++ 7245+): resize to match stage3 + JXL
-        // compress.  The port currently keeps the mask uncompressed.
+        // compress.
 
         if self.transparency_mask().is_some() {
-            // PORT-NOTE(dng_negative.cpp:7245): ResizeTransparencyToMatchStage3
-            // + CompressTransparencyMaskJXL are not ported yet.
+            self.resize_transparency_to_match_stage3(host, true)?;
+
+            self.compress_transparency_mask_jxl(host, _writer, false)?;
         }
+
+        // Semantic masks (C++ 7997): JXL compress.
+
+        self.compress_semantic_masks_jxl(host, _writer, false)?;
 
         Ok(())
     }
@@ -6982,6 +6997,53 @@ impl DngNegative {
     }
 
     /// `RawLossyCompressedTransparencyMask ()`.
+    /// `CompressTransparencyMaskJXL (host, writer, nearLosslessOK)`
+    /// (dng_negative.cpp:7139).
+    pub fn compress_transparency_mask_jxl(
+        &mut self,
+        host: &mut DngHost,
+        _writer: &mut crate::dng_image_writer::DngImageWriter,
+        near_lossless_ok: bool,
+    ) -> DngResult<()> {
+        if host.save_dng_version() != 0
+            && host.save_dng_version()
+                < crate::dng_image_writer::min_backward_version_for_compression(ccJXL)
+        {
+            return Ok(());
+        }
+
+        let can_encode = self.raw_lossy_compressed_transparency_mask().is_none()
+            && self
+                .raw_transparency_mask()
+                .map(|mask| {
+                    let img = mask.read().unwrap();
+
+                    supports_jxl_image(&*img)
+                        && (img.pixel_type() != ttFloat
+                            || self.raw_transparency_mask_bit_depth().unwrap_or(0) == 16)
+                })
+                .unwrap_or(false);
+
+        if can_encode {
+            let mask_image = self.raw_transparency_mask().unwrap().clone();
+
+            let use_case = if near_lossless_ok {
+                DngJxlUseCase::Transparency
+            } else {
+                DngJxlUseCase::LosslessTransparency
+            };
+
+            let lossy_image = encode_jxl_image(&mask_image, use_case)?;
+
+            self.raw_lossy_compressed_transparency_mask =
+                Some(Box::new(lossy_image.base));
+
+            self.clear_raw_image_digest();
+        }
+
+        Ok(())
+    }
+
     pub fn raw_lossy_compressed_transparency_mask(&self) -> Option<&DngLossyCompressedImage> {
         self.raw_lossy_compressed_transparency_mask.as_deref()
     }
@@ -7328,6 +7390,57 @@ impl DngNegative {
     }
 
     /// `NumSemanticMasks ()`.
+    /// `CompressSemanticMasksJXL (host, writer, nearLosslessOK)`
+    /// (dng_negative.cpp:7997).
+    pub fn compress_semantic_masks_jxl(
+        &mut self,
+        host: &mut DngHost,
+        _writer: &mut crate::dng_image_writer::DngImageWriter,
+        near_lossless_ok: bool,
+    ) -> DngResult<()> {
+        if host.save_dng_version() != 0
+            && host.save_dng_version()
+                < crate::dng_image_writer::min_backward_version_for_compression(ccJXL)
+        {
+            return Ok(());
+        }
+
+        let mask_count = self.num_semantic_masks();
+
+        for i in 0..mask_count as usize {
+            let can_encode = self.semantic_masks[i]
+                .lossy_compressed
+                .is_none()
+                && self.semantic_masks[i]
+                    .mask
+                    .as_ref()
+                    .map(|mask| {
+                        let img = mask.read().unwrap();
+
+                        supports_jxl_image(&*img)
+                            && (img.pixel_type() != ttFloat || near_lossless_ok)
+                    })
+                    .unwrap_or(false);
+
+            if can_encode {
+                let mask_image = self.semantic_masks[i].mask.as_ref().unwrap().clone();
+
+                let use_case = if near_lossless_ok {
+                    DngJxlUseCase::SemanticMask
+                } else {
+                    DngJxlUseCase::LosslessSemanticMask
+                };
+
+                let lossy_image = encode_jxl_image(&mask_image, use_case)?;
+
+                self.semantic_masks[i].lossy_compressed =
+                    Some(std::sync::Arc::new(lossy_image.base));
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn num_semantic_masks(&self) -> uint32 {
         self.semantic_masks.len() as uint32
     }
