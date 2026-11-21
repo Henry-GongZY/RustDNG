@@ -38,6 +38,10 @@ struct Options {
     out_ppm: Option<String>,
     /// `-tif <file>` — write the stage3 image as an uncompressed TIFF.
     out_tif: Option<String>,
+    /// `-1/-2/-3 <base>` — dump stage 1/2/3 to "<base>.tif" (C++ parity).
+    dump_stage1: Option<String>,
+    dump_stage2: Option<String>,
+    dump_stage3: Option<String>,
     /// `-cs1..-cs6/-csP3/-cs2020` — render color space index.
     color_space: u8,
     /// `-16` / `-32` — render output depth.
@@ -121,12 +125,55 @@ fn validate_file(options: &Options, path: &str) -> dng_core::DngResult<()> {
     // Pixel pipeline (skippable).
 
     if !options.no_stages {
+        // -1/-2/-3 stage dumps (C++ dng_validate parity: uncompressed
+        // TIFF, piRGB for >= 3 planes, piBlackIsZero otherwise).
+
+        let dump_stage = |target: &Option<String>, name: &str, image: Option<&dng_core::ImageRef>| {
+            if let (Some(base), Some(img)) = (target, image) {
+                let path = format!("{base}.tif");
+
+                let img = img.read().unwrap();
+
+                let photometric = if img.planes() >= 3 {
+                    dng_core::dng_tag_values::piRGB
+                } else {
+                    dng_core::dng_tag_values::piBlackIsZero
+                };
+
+                let mut out_stream =
+                    DngFileStream::open_write(Path::new(&path)).unwrap();
+
+                let mut writer = dng_sdk::dng_image_writer::DngImageWriter::new();
+
+                writer
+                    .write_tiff(
+                        &mut out_stream,
+                        &*img,
+                        &dng_sdk::dng_image_writer::TiffWriteOptions {
+                            photometric,
+                            compression: dng_core::dng_tag_values::ccUncompressed,
+                            icc_profile: None,
+                            software: Some("RustDNG dng-validate"),
+                            metadata: None,
+                        },
+                    )
+                    .unwrap();
+
+                println!("  dumped {name} to {}", path);
+            }
+        };
+
+
         negative
             .read_stage1_image(&mut host, &mut stream, &mut info)
             .map_err(|err| {
                 eprintln!("(failed at read_stage1_image: {err:?})");
                 err
             })?;
+
+        // C++ dng_validate dumps stage 1 right after the read.
+
+        dump_stage(&options.dump_stage1, "stage1", negative.stage1_image());
 
         negative.validate_raw_image_digest(&mut host)?;
 
@@ -136,12 +183,22 @@ fn validate_file(options: &Options, path: &str) -> dng_core::DngResult<()> {
                 eprintln!("(failed at build_stage2_image: {err:?})");
                 err
             })?;
+
+        // C++ dng_validate dumps stage 2 right after the linearization.
+
+        dump_stage(&options.dump_stage2, "stage2", negative.stage2_image());
+
         negative
             .build_stage3_image(&mut host, -1)
             .map_err(|err| {
                 eprintln!("(failed at build_stage3_image: {err:?})");
                 err
             })?;
+
+        // C++ dng_validate dumps stage 3 right after the demosaic.
+
+        dump_stage(&options.dump_stage3, "stage3", negative.stage3_image());
+
 
         let describe = |name: &str, image: Option<&dng_core::ImageRef>| {
             match image {
@@ -321,6 +378,9 @@ fn main() {
         out_dng: None,
         out_ppm: None,
         out_tif: None,
+        dump_stage1: None,
+        dump_stage2: None,
+        dump_stage3: None,
         color_space: 1, // sRGB
         render_16bit: false,
         render_32bit: false,
@@ -354,6 +414,24 @@ fn main() {
                 let v = args.next().unwrap_or_default();
                 if !v.is_empty() {
                     options.out_tif = Some(v);
+                }
+            }
+            "-1" => {
+                let v = args.next().unwrap_or_default();
+                if !v.is_empty() {
+                    options.dump_stage1 = Some(v);
+                }
+            }
+            "-2" => {
+                let v = args.next().unwrap_or_default();
+                if !v.is_empty() {
+                    options.dump_stage2 = Some(v);
+                }
+            }
+            "-3" => {
+                let v = args.next().unwrap_or_default();
+                if !v.is_empty() {
+                    options.dump_stage3 = Some(v);
                 }
             }
             "-cs1" => options.color_space = 1,
