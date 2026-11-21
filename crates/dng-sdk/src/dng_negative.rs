@@ -6629,10 +6629,89 @@ impl DngNegative {
 
             self.set_stage3_image(Some(trimmed));
 
-            // PORT-NOTE(dng_negative.cpp:6903): the profile gain-table-map
-            // re-projection when the stage3 is trimmed is not ported (the
-            // gain map API exposes the geometry, but the C++ reconstructs
-            // the underlying buffer through private accessors).
+            // Re-project the profile gain table map into the trimmed
+            // coordinate system (dng_negative.cpp:6903).
+
+            if self.has_profile_gain_table_map() {
+                let old_map = self.profile_gain_table_map()?;
+
+                // Adjust origin: map the normalized origin into the original
+                // stage3 pixel space, then renormalize into the crop area.
+
+                let old_origin = old_map.origin();
+
+                let origin_pix_v = dng_core::dng_utils::lerp_real64(
+                    original_stage3_bounds.t as f64,
+                    original_stage3_bounds.b as f64,
+                    old_origin.v,
+                );
+                let origin_pix_h = dng_core::dng_utils::lerp_real64(
+                    original_stage3_bounds.l as f64,
+                    original_stage3_bounds.r as f64,
+                    old_origin.h,
+                );
+
+                let new_origin = dng_core::DngPointReal64::new(
+                    (origin_pix_v - default_crop_area.t as f64)
+                        / default_crop_area.h() as f64,
+                    (origin_pix_h - default_crop_area.l as f64)
+                        / default_crop_area.w() as f64,
+                );
+
+                // Adjust spacing (scale along axes whose grid has > 1 point).
+
+                let old_spacing = old_map.spacing();
+
+                let mut new_spacing = old_spacing;
+
+                let points = old_map.points();
+
+                if points.h > 1 {
+                    new_spacing.h *=
+                        original_stage3_bounds.w() as f64 / default_crop_area.w() as f64;
+                }
+
+                if points.v > 1 {
+                    new_spacing.v *=
+                        original_stage3_bounds.h() as f64 / default_crop_area.h() as f64;
+                }
+
+                // Scan fp32 samples for the min & max gains.  The Rust port
+                // has no original-buffer concept (C++ IsUint8 () /
+                // HasOriginalBuffer () / SetOriginalBuffer) — the uint8
+                // original-snapshot path is therefore not applicable.
+
+                let mut gain_min = old_map.gain_min();
+                let mut gain_max = old_map.gain_max();
+
+                for sample in old_map.buffer() {
+                    gain_min = gain_min.min(*sample);
+                    gain_max = gain_max.max(*sample);
+                }
+
+                // Make the new gain table map (grid points unchanged, data
+                // type 0 = store as uint8).
+
+                let mut new_map = crate::dng_gain_map::DngGainTableMap::new(
+                    points,
+                    new_spacing,
+                    new_origin,
+                    old_map.num_table_points(),
+                    old_map.map_input_weights(),
+                    0,
+                    old_map.gamma(),
+                    gain_min,
+                    gain_max,
+                )?;
+
+                // Copy over fp32 points (grid unchanged, same layout).
+
+                new_map
+                    .buffer_mut()
+                    .copy_from_slice(old_map.buffer());
+
+                                self.set_profile_gain_table_map(Some(std::sync::Arc::new(new_map)));
+            }
         }
 
         // Proxy size computation (C++ 6940-7010).
@@ -9233,5 +9312,121 @@ mod tests {
         assert_eq!(lossy.row_interleave_factor, 2);
         assert_eq!(lossy.column_interleave_factor, 2);
         assert!(lossy.tiles.data[0].is_some());
+    }
+    /// Gain-table-map re-projection during convert_to_proxy: origin and
+    /// spacing must be re-projected into the trimmed coordinate system and
+    /// the fp32 samples preserved.
+    #[test]
+    fn convert_to_proxy_gain_table_reprojection() {
+        let mut host = DngHost::new();
+
+        let mut negative = DngNegative::new(&mut host).unwrap();
+
+        let width = 64u32;
+        let height = 48u32;
+
+        let bounds = DngRect::from_corners(0, 0, height as int32, width as int32);
+
+        let image: ImageRef = DngSimpleImage::new(bounds, 1, ttShort)
+            .unwrap()
+            .into_image_ref()
+            .unwrap();
+
+        {
+            let mut buffer = DngPixelBuffer::with_planar_config(
+                bounds,
+                0,
+                1,
+                ttShort,
+                pcInterleaved,
+                DngPixelBuffer::allocate_data(bounds, 1, ttShort).unwrap(),
+            )
+            .unwrap();
+
+            let samples = buffer.as_u16_slice_mut().unwrap();
+
+            for (index, sample) in samples.iter_mut().enumerate() {
+                *sample = ((index * 401) % 60000 + 2000) as u16;
+            }
+
+            image.write().unwrap().do_put(&buffer).unwrap();
+        }
+
+        negative.set_stage3_image(Some(image));
+        negative.set_default_crop_size_u32(width, height);
+        negative.set_active_area(bounds);
+
+        // Profile gain table map: 4x3 grid, 8 table points, origin at the
+        // image center (0.5, 0.5).
+
+        let mut map = crate::dng_gain_map::DngGainTableMap::new(
+            DngPoint::new(4, 3),
+            dng_core::DngPointReal64::new(16.0, 21.333), // spacing (w/4, h/3)
+            dng_core::DngPointReal64::new(0.5, 0.5),
+            8,
+            &[1.0, 0.0, 0.0, 0.0, 0.0],
+            1, // fp32 storage
+            1.0,
+            0.5,
+            2.0,
+        )
+        .unwrap();
+
+        for index in 0..map.num_samples() as usize {
+            map.buffer_mut()[index] = 1.0 + (index as f32) * 0.001;
+        }
+
+        let expected_samples: Vec<f32> = map.buffer().to_vec();
+
+        negative.set_profile_gain_table_map(Some(std::sync::Arc::new(map)));
+
+        // Proxy at a quarter area forces the stage3 trim (64x48 -> 16x12
+        // via resample; the trim happens because the stage3 bounds differ
+        // from... wait — stage3 bounds == default crop area here, so no
+        // trim occurs.  Force the trim by cropping the default area first.
+
+        // Set default crop to the central half so the stage3 must be
+        // trimmed (bounds differ from crop area).
+        negative.set_default_crop_size_u32(width / 2, height / 2);
+        negative.set_default_crop_origin_u32(width / 4, height / 4);
+
+        negative
+            .convert_to_proxy(&mut host, &mut crate::dng_image_writer::DngImageWriter::new(), 8, 0)
+            .unwrap();
+
+        // The gain table map must have been re-projected.
+
+        assert!(negative.has_profile_gain_table_map());
+
+        let map = negative.profile_gain_table_map().unwrap();
+
+        // Spacing scaled by (s3bounds.h / crop.h) = (48 / 24) = 2 per axis
+        // where the grid has > 1 point (both here).  The old spacing was
+        // (v=16, h=21.333).
+
+        let spacing = map.spacing();
+
+        assert!((spacing.v - 32.0).abs() < 0.1, "spacing.v {}", spacing.v);
+        assert!((spacing.h - 42.666).abs() < 0.1, "spacing.h {}", spacing.h);
+
+        // Origin: the old stage3 spans (0,0)-(48,64); the normalized origin
+        // 0.5 maps to pixel space lerp(0,48,0.5)=24 v / lerp(0,64,0.5)=32 h,
+        // renormalized into the crop area (origin (12,16), size 24x32):
+        // (24-12)/24 = 0.5, (32-16)/32 = 0.5.
+
+        let origin = map.origin();
+
+        assert!((origin.v - 0.5).abs() < 1e-6, "origin.v {}", origin.v);
+        assert!((origin.h - 0.5).abs() < 1e-6, "origin.h {}", origin.h);
+
+        // Samples preserved bit-exact.
+
+        assert_eq!(map.num_samples(), 4 * 3 * 8);
+        assert_eq!(map.data_type(), 0, "must be re-stored as uint8");
+
+        // Samples preserved bit-exact (buffer snapshot taken before the
+        // conversion).
+
+        assert_eq!(map.buffer(), &expected_samples[..]);
     }
 }

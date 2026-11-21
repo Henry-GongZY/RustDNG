@@ -515,6 +515,12 @@ impl DngGainTableMap {
     }
 
     /// Mutable access to the gain sample buffer.
+    /// Read-only access to the fp32 sample buffer (num_samples entries,
+    /// laid out as (row, col, table_index) with row_step = NumTablePoints).
+    pub fn buffer(&self) -> &[f32] {
+        &self.buffer
+    }
+
     pub fn buffer_mut(&mut self) -> &mut [f32] {
         &mut self.buffer
     }
