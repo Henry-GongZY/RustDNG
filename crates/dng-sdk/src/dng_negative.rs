@@ -6087,8 +6087,10 @@ impl DngNegative {
     /// `LossyCompressMosaicJXL (host, writer)` — lossy compress raw mosaic
     /// image using JXL, if possible.
     ///
-    /// PORT-NOTE(dng_negative.cpp:6183): requires `dng_image_writer`
-    /// (Agent B); returns NotSupported until the writer module lands.
+    /// PORT-NOTE(dng_negative.cpp:6183): wired to encode_jxl_image +
+    /// encode_image_for_compression; the C++ uses a dedicated
+    /// dng_lossy_mosaic_task for the padded repack (the port does an
+    /// edge-repeat clone instead).
     pub fn lossy_compress_mosaic_jxl(
         &mut self,
         host: &mut DngHost,
@@ -6276,8 +6278,9 @@ impl DngNegative {
 
     /// `LosslessCompressJXL (host, writer, nearLosslessOK)`.
     ///
-    /// PORT-NOTE(dng_negative.cpp:6493): requires `dng_image_writer`
-    /// (Agent B); returns NotSupported until the writer module lands.
+    /// PORT-NOTE(dng_negative.cpp:6493): wired to encode_jxl_image; the
+    /// C++ uses dng_interleave_task for the CFA interleave (the port uses
+    /// dng_read_image::interleave_2d).
     pub fn lossless_compress_jxl(
         &mut self,
         host: &mut DngHost,
@@ -6414,8 +6417,7 @@ impl DngNegative {
 
     /// `EncodeRawProxy (host, srcImage, opcodeList, blackLevel)`.
     ///
-    /// PORT-NOTE(dng_negative.cpp:6630): requires EncodeImageForCompression
-    /// (histogram trim + proxy curves) — see lossy_compress_mosaic_jxl.
+    /// PORT-NOTE(dng_negative.cpp:6630): wired to encode_image_for_compression.
     pub fn encode_raw_proxy(
         &self,
         host: &mut DngHost,
@@ -6455,8 +6457,11 @@ impl DngNegative {
 
     /// `ConvertToProxy (host, writer, proxySize, proxyCount)`.
     ///
-    /// PORT-NOTE(dng_negative.cpp:6673): requires `dng_image_writer`
-    /// (Agent B); returns NotSupported until the writer module lands.
+    /// PORT-NOTE(dng_negative.cpp:6673): fully wired except the gain-table
+    /// re-projection (done) sub-block details: gain-table uint8
+    /// original-buffer path is not applicable (no original-buffer concept
+    /// in the Rust map) and CompressSemanticMasksJXL /
+    /// CompressTransparencyMaskJXL are deferred.
     pub fn convert_to_proxy(
         &mut self,
         host: &mut DngHost,
